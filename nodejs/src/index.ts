@@ -21,6 +21,12 @@ export { DisableBypassPermissionsModes, RuntimeConnection } from "./types.js";
 export { BuiltInTools, ToolSet } from "./toolSet.js";
 export { CopilotSession, type AssistantMessageEvent } from "./session.js";
 export { defineWorkflow, WorkflowResumeError, isWorkflowRunTerminal } from "./workflow.js";
+export type {
+    WorkflowActivityInvocation,
+    WorkflowExecutionHost,
+    WorkflowExecutor,
+    WorkflowInvocation,
+} from "./workflow-executor.js";
 export {
     Canvas,
     CanvasError,

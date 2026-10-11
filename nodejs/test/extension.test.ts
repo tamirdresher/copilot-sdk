@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CopilotClient } from "../src/client.js";
 import { approveAll, type CopilotSession } from "../src/index.js";
 import { createCanvas, defineWorkflow, joinSession } from "../src/extension.js";
+import type { WorkflowExecutor } from "../src/extension.js";
 import { defaultJoinSessionPermissionHandler } from "../src/types.js";
 
 describe("joinSession", () => {
@@ -103,12 +104,17 @@ describe("joinSession", () => {
             meta: { name: "review", description: "Review", phases: [] },
             run: async () => null,
         });
+        const workflowExecutor: WorkflowExecutor = {
+            execute: async () => ({ result: null }),
+        };
 
-        await joinSession({ workflows: [workflow] });
+        await joinSession({ workflows: [workflow], workflowExecutor });
 
         expect(resumeForExtension.mock.calls[0]![2]).toEqual({
             workflows: [workflow],
+            workflowExecutor,
         });
+        expect(resumeForExtension.mock.calls[0]![1]).not.toHaveProperty("workflowExecutor");
     });
 
     it.each([true, false])(

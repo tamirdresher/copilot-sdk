@@ -29,6 +29,16 @@
                 "types": "./dist/extension.d.ts",
                 "default": "./dist/cjs/extension.js"
             }
+        },
+        "./workflow-dts": {
+            "import": {
+                "types": "./dist/workflow-dts.d.ts",
+                "default": "./dist/workflow-dts.js"
+            },
+            "require": {
+                "types": "./dist/workflow-dts.d.ts",
+                "default": "./dist/cjs/workflow-dts.js"
+            }
         }
     },
     "type": "module",
@@ -43,6 +53,7 @@
         "prepare:runtime": "tsx scripts/prepare-runtime.ts",
         "test": "vitest run",
         "test:unit": "vitest run --exclude=\"test/e2e/**\"",
+        "test:workflow-dts": "npm run build && vitest run --config vitest.dts.config.ts",
         "test:watch": "vitest",
         "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" --ignore-path .prettierignore",
         "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" --ignore-path .prettierignore",
@@ -65,6 +76,7 @@
     "author": "GitHub",
     "license": "MIT",
     "dependencies": {
+        "@microsoft/durabletask-js": "0.4.0",
         "koffi": "3.2.1",
         "vscode-jsonrpc": "8.2.1",
         "zod": "4.3.6"

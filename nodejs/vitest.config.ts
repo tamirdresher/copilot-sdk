@@ -90,6 +90,7 @@ export default defineConfig({
             "**/dist/**",
             "**/*.d.ts",
             "**/basic-test.ts", // Old manual test
+            "**/test/integration/workflow-dts.test.ts",
             ...(isInProcessTransport ? inProcessBlockedE2E : []),
             ...(isByokBackend ? selfConfiguredBackendE2E : []),
         ],

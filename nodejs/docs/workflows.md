@@ -259,3 +259,215 @@ Aborting rejects the wait and has no effect on the run, which keeps executing—
 Listen for the ephemeral `workflow.run_updated` event. Its `{ runId, revision }` payload is an invalidation signal. Re-read the desired API when a newer monotonic revision arrives.
 
 Revisions cover durable lifecycle, accounting, phase, agent, and progress changes. Continuous read-time fields can change without a new revision. These include `observedAt`, active-time calculations, live counts, and a live agent's status or prompt-safe activity text. Workflow prompts are never exposed by these APIs. A run is visible only through the session that owns it.
+
+## DTS execution (SDK draft)
+
+The experimental `@github/copilot-sdk/workflow-dts` entry point adds a Durable
+Task Scheduler (DTS) execution provider. It preserves `defineWorkflow` and
+ordinary `async run(ctx)` bodies, but supports a deliberately restricted
+sequential-effects profile. Omitting the provider preserves all existing local
+workflow behavior described above.
+
+> [!WARNING]
+> This is an SDK execution slice, not a shipped Copilot managed workflow service.
+> Native CLI authoring, automatic reconnection, pause/cancel mapping, and
+> resource-limit accounting require runtime integration. The existing CLI
+> authoring tool does not automatically select this provider.
+
+Workflow intent does not name a scheduler resource, endpoint, or connection
+string. The owning Copilot runtime or headless host supplies already configured
+DTS client/worker objects and an execution host. Copilot can supply those
+bindings from a managed service in the future without changing author metadata.
+This draft does not provision Azure resources or implement that service.
+
+### Authoring and host binding
+
+An existing `.mjs` workflow can use sequential awaited agents and steps:
+
+```js
+import { defineWorkflow } from "@github/copilot-sdk/extension";
+
+export const review = defineWorkflow({
+    meta: {
+        name: "durable-review",
+        description: "Inspect, then verify a review.",
+        phases: [],
+    },
+    run: async (ctx) => {
+        const finding = await ctx.agent("Inspect the change", { label: "inspect" });
+        const report = await ctx.step("report-v1", () => ({ finding }));
+        const verified = await ctx.agent(JSON.stringify(report), { label: "verify" });
+        return { report, verified };
+    },
+});
+```
+
+The **host**, not the author, constructs the executor. In this host-side example,
+`client`, `worker`, and `executionHost` are supplied bindings, and `codeVersion`
+identifies the immutable artifact containing the workflow and its dependencies:
+
+```js
+import { DtsWorkflowExecutor } from "@github/copilot-sdk/workflow-dts";
+
+export async function runInHeadlessHost(
+    { client, worker, executionHost, codeVersion },
+    invocation
+) {
+    const executor = new DtsWorkflowExecutor({
+        client,
+        worker,
+        executionHost,
+        codeVersion,
+        workflows: [review],
+    });
+    await worker.start();
+    try {
+        // invocation: { scopeId, runId, args }
+        return await executor.run(review, invocation);
+    } finally {
+        await worker.stop();
+        await client.stop();
+    }
+}
+```
+
+`scopeId` is the stable owning session/service scope. `runId` identifies the
+durable run within it. Reusing both attaches to the existing scheduler instance;
+changed arguments, workflow code/metadata, artifact identity, or Node runtime
+version reject rather than starting a different run. The provider also pins its
+driver protocol and Durable Task SDK version. Keep the complete artifact
+unchanged until its runs settle. A function-source hash cannot validate imported
+helpers or module state: the host must pin those dependencies with `codeVersion`.
+
+`WorkflowExecutionHost` dispatches effects:
+
+```ts
+import type {
+    JsonValue,
+    WorkflowActivityInvocation,
+    WorkflowAgentOptions,
+} from "@github/copilot-sdk";
+
+interface WorkflowExecutionHost {
+    agent(
+        invocation: WorkflowActivityInvocation,
+        prompt: string,
+        options: WorkflowAgentOptions,
+    ): Promise<JsonValue>;
+    step(
+        invocation: WorkflowActivityInvocation,
+        key: string,
+        producer: () => JsonValue | Promise<JsonValue>,
+    ): Promise<JsonValue>;
+}
+```
+
+Activity invocations carry `{ scopeId, runId, args, operationId }`. Use
+`operationId` for host-side idempotency. An agent host returns JSON, including
+`null` for an ordinary agent failure, and rejects for a hard runtime failure.
+A local step host executes `producer()` and returns its JSON result. A future
+sandbox/cloud host must load the pinned artifact and reconstruct the operation
+there, not serialize the closure. Scheduler history and execution location are
+separate responsibilities.
+
+The existing extension registration path also accepts
+`joinSession({ workflows: [review], workflowExecutor: executor })`. The binding
+stays local to the joining SDK connection; it is stripped from wire metadata.
+Each dispatched agent uses the currently bound session execution token. Tokens,
+session objects, credentials, and closures are never stored in DTS history.
+This contribution binding does not by itself implement automatic native
+CLI recovery or durable lifecycle controls.
+
+### Replay and activity semantics
+
+The deterministic DTS orchestrator schedules an **Advance** activity, which
+replays the user's async body outside the orchestrator. Settled `ctx` operations
+validate their ordered command identities and return cloned recorded outcomes.
+The first unseen operation exposes a JSON command out of band and returns an
+unresolved promise to the body. Advance returns the command to DTS without
+throwing a suspension exception through the author's `catch` or `finally`.
+DTS then schedules a separate **ExecuteAgent** or **ExecuteStep** activity and
+records its outcome before scheduling the next Advance.
+
+ExecuteStep replays the same prefix to recreate the producer at its operation
+locator. It captures prior recorded JSON values again; it does not persist a
+JavaScript heap. Captures must be reproducible from immutable code, invocation
+arguments, and prior results. Mutable module/global state, an old session object,
+or an external live handle is not a durable capture.
+
+Agent memoization uses the canonical prompt and supported options, including
+`label`. Identical sequential calls reuse their fulfilled outcome, including
+`null`. Distinct labels remain independent. A step's key remains its sole
+memoization identity, even when a later same-key producer differs. Version keys
+when their meaning changes. Rejected effects are recorded and replayed as
+rejections, not converted to `null` or memoized as successful results.
+JSON-RPC failures retain their name, message, numeric code, and JSON data.
+Other errors retain name/message, not custom prototypes or stacks; JSON-valued
+rejections retain their value.
+
+Activities are **at-least-once**, not exactly-once side effects. Losing a worker
+after an effect but before DTS acknowledges its completion can repeat it.
+Completed recorded activities are not re-executed during ordinary recovery.
+Keep side effects idempotent. History stores prompts, inputs, results, and
+failure text; the owning service must enforce access control and retention.
+This draft does not provide tenant isolation.
+
+### Supported subset and lifecycle boundaries
+
+Only sequential, awaited `ctx.agent()` and journaled `ctx.step()` are supported.
+`ctx.parallel`, `ctx.pipeline`, `ctx.pause`, `ctx.phase`, `ctx.log`, nested
+workflows, `ctx.session`, volatile steps, and effects nested inside producers
+fail explicitly. Concurrent/unawaited SDK calls and competing SDK calls through
+raw `Promise.all`/`Promise.race` are rejected; arbitrary JavaScript race semantics
+are not implemented. Profile violations cannot be made valid by catching them.
+Declared resource limits reject registration until native accounting is wired.
+
+The body outside producers must be pure and deterministic. Put I/O in a step
+producer or the execution host. Replay diagnoses new async resources and waits
+that never reach an SDK boundary. This is **not a sandbox**: synchronous I/O,
+clock/random reads, mutations, and all possible promise misuse cannot be
+prevented or completely detected. Invalid raw I/O can begin before a diagnostic
+is raised. Those operations are unsupported even when no diagnostic fires.
+An infinite CPU/microtask loop is not contained by this driver.
+`ctx.signal` is available only inside a producer and uses the live binding's
+signal when present, never a signal restored from history.
+
+Stopping a worker leaves scheduler history intact. A cold worker with the same
+artifact and a fresh `executionHost` resumes incomplete activities. Aborting
+`executor.run` stops that caller's wait; it does not terminate DTS. Scheduler
+termination/suspension, Copilot pause/cancel outcomes, budget enforcement, and
+native session-token rebinding need a runtime/service owner before this binding
+can be shipped through native authoring tools. Unsupported operations do not
+fall back to the local journal.
+
+### Developer restart proof
+
+The provider requires Node.js 22 or later; the local SDK's prerequisites are
+unchanged. The explicit DTS test profile requires a responsive Docker engine
+and the Microsoft DTS emulator. From the SDK root on Windows:
+
+```powershell
+npm --prefix .\nodejs ci --ignore-scripts --registry=https://packagefeedproxy.microsoft.io/npm/
+npm --prefix .\nodejs run test:workflow-dts
+```
+
+The test creates one uniquely named emulator container with loopback-only
+dynamic ports. It uses the `default` task hub and no authentication, and records
+the pinned image digest in its proof output. No Azure resources are provisioned.
+It fails if Docker/emulator execution is unavailable; it does not substitute a
+mock backend. The default Node suite does not start this container.
+
+Worker A completes an agent activity and enters a second one. The test verifies
+the first completion in real DTS history, kills only worker A's owned PID,
+and starts an independently loaded worker B against the still-running scheduler.
+It asserts the same instance ID, exactly one execution of the first activity,
+redelivery of the incomplete second activity with the same operation ID and
+prior value, reconstruction of the report step, and exact final JSON output.
+It cleans up only its workers, container, and observation directory.
+The host is a deterministic fixture, not a live Copilot model. Separate in-memory
+tests cover replay/dispatch semantics; they are not restart evidence.
+This proves worker recovery, not scheduler-container restart or disk-loss
+recovery.
+
+Before release, reconcile this standalone SDK draft into the runtime
+repository's `src/sdk`; the runtime release snapshot owns the published tree.

@@ -10,6 +10,14 @@ import {
     type ResumeSessionConfig,
 } from "./types.js";
 import type { WorkflowHandle } from "./workflow.js";
+import type { WorkflowExecutor } from "./workflow-executor.js";
+
+export type {
+    WorkflowActivityInvocation,
+    WorkflowExecutionHost,
+    WorkflowExecutor,
+    WorkflowInvocation,
+} from "./workflow-executor.js";
 
 export {
     Canvas,
@@ -63,6 +71,13 @@ export type JoinSessionConfig = Omit<
      * change or be removed in future SDK or CLI releases.
      */
     workflows?: WorkflowHandle[];
+    /**
+     * Optional host-owned execution provider, retained locally, never sent as metadata.
+     * Omission preserves the existing local async workflow behavior.
+     *
+     * @experimental
+     */
+    workflowExecutor?: WorkflowExecutor;
 };
 
 export type { ExtensionInfo } from "./types.js";
@@ -132,6 +147,7 @@ export async function joinSession(config: JoinSessionConfig = {}): Promise<Copil
         skillProvider: _strippedSkillProvider,
         imageGeneration: _strippedImageGeneration,
         workflows,
+        workflowExecutor,
         requestedEnvironmentVariables,
         ...rest
     } = config as JoinSessionConfig & {
@@ -151,7 +167,7 @@ export async function joinSession(config: JoinSessionConfig = {}): Promise<Copil
             onPermissionRequest: config.onPermissionRequest ?? defaultJoinSessionPermissionHandler,
             suppressResumeEvent: config.suppressResumeEvent ?? true,
         },
-        { workflows },
+        { workflows, workflowExecutor },
         requestedEnvironmentVariables?.length ? { requestedEnvironmentVariables } : undefined
     );
 }

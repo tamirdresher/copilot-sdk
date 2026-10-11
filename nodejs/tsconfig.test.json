@@ -15,7 +15,10 @@
         "test/session-config-types.test.ts",
         "test/sandbox-config.test.ts",
         "test/message-source.test.ts",
-        "test/legacy-request-compatibility.test.ts"
+        "test/legacy-request-compatibility.test.ts",
+        "test/workflow-replay.test.ts",
+        "test/workflow-dts.test.ts",
+        "test/integration/workflow-dts.test.ts"
     ],
     "exclude": ["node_modules", "dist"]
 }

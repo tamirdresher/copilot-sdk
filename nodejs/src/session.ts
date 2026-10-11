@@ -90,6 +90,8 @@ import {
     type JsonValue,
     type WorkflowStepOptions,
 } from "./workflow.js";
+import type { WorkflowExecutor } from "./workflow-executor.js";
+import { assertWorkflowResult, assertWorkflowStepResult } from "./workflow-json.js";
 
 function isWorkflowResumeErrorCode(value: unknown): value is WorkflowResumeErrorCode {
     return (
@@ -1693,7 +1695,7 @@ export class CopilotSession {
      * @param workflows - Workflow handles declared by the joining extension.
      * @internal Called by the SDK when an extension joins a session.
      */
-    registerWorkflows(workflows?: WorkflowHandle[]): void {
+    registerWorkflows(workflows?: WorkflowHandle[], workflowExecutor?: WorkflowExecutor): void {
         this.assertConnected();
         this.workflows.clear();
         if (!workflows || workflows.length === 0) {
@@ -1860,6 +1862,31 @@ export class CopilotSession {
                     const execution = { active: true };
                     const result = await workflowExecutionStore.run(execution, async () => {
                         try {
+                            if (workflowExecutor) {
+                                const completed = await workflowExecutor.execute(
+                                    definition,
+                                    {
+                                        scopeId: self.sessionId,
+                                        runId: params.runId,
+                                        args: params.args,
+                                    },
+                                    {
+                                        agent: async (_invocation, prompt, options) => {
+                                            const value = await context.agent(prompt, options);
+                                            assertWorkflowStepResult(value, "agent");
+                                            return value;
+                                        },
+                                        step: async (_invocation, key, producer) => {
+                                            throwIfWorkflowAborted(controller.signal);
+                                            const value = await producer();
+                                            assertWorkflowStepResult(value, key);
+                                            return value;
+                                        },
+                                    },
+                                    controller.signal
+                                );
+                                return completed.result;
+                            }
                             return await definition.run(context);
                         } finally {
                             execution.active = false;
@@ -2701,202 +2728,4 @@ function toCanvasRpcError(error: unknown): ResponseError<unknown> {
 // The provider's own error text is deliberately not forwarded to the runtime.
 function skillProviderFailure(operation: string): ResponseError<undefined> {
     return new ResponseError(ErrorCodes.InternalError, `Skill provider ${operation} failed`);
-}
-
-type WorkflowResultValidationCategory =
-    | "unsupported_type"
-    | "non_finite_number"
-    | "negative_zero"
-    | "cyclic_value"
-    | "nested_undefined"
-    | "unsupported_object";
-
-interface StrictJsonValidationContext {
-    code: "workflow_result_not_json" | "workflow_step_not_json";
-    label: string;
-    allowTopLevelUndefined: boolean;
-}
-
-function strictJsonValidationError(
-    context: StrictJsonValidationContext,
-    category: WorkflowResultValidationCategory,
-    message: string,
-    path: string
-): ResponseError<{ code: string; category: WorkflowResultValidationCategory; path: string }> {
-    return new ResponseError(ErrorCodes.InternalError, message, {
-        code: context.code,
-        category,
-        path,
-    });
-}
-
-function assertStrictJson(
-    value: unknown,
-    context: StrictJsonValidationContext
-): asserts value is JsonValue | undefined {
-    const ancestors = new Set<object>();
-
-    const visit = (current: unknown, path: string, allowUndefined: boolean): void => {
-        if (current === undefined) {
-            if (allowUndefined) {
-                return;
-            }
-            throw strictJsonValidationError(
-                context,
-                "nested_undefined",
-                `${context.label} contains nested undefined at ${path}`,
-                path
-            );
-        }
-        if (current === null || typeof current === "boolean" || typeof current === "string") {
-            return;
-        }
-        if (typeof current === "number") {
-            if (!Number.isFinite(current)) {
-                throw strictJsonValidationError(
-                    context,
-                    "non_finite_number",
-                    `${context.label} contains a non-finite number at ${path}`,
-                    path
-                );
-            }
-            // JSON serializes -0 as "0", so a journaled -0 would come back as 0
-            // after a resume and break the lossless replay guarantee.
-            if (Object.is(current, -0)) {
-                throw strictJsonValidationError(
-                    context,
-                    "negative_zero",
-                    `${context.label} contains negative zero at ${path}; normalize it to 0`,
-                    path
-                );
-            }
-            return;
-        }
-        if (
-            typeof current === "function" ||
-            typeof current === "symbol" ||
-            typeof current === "bigint"
-        ) {
-            throw strictJsonValidationError(
-                context,
-                "unsupported_type",
-                `${context.label} contains a function, symbol, or BigInt at ${path}`,
-                path
-            );
-        }
-        if (typeof current !== "object") {
-            throw strictJsonValidationError(
-                context,
-                "unsupported_type",
-                `${context.label} contains a function, symbol, or BigInt at ${path}`,
-                path
-            );
-        }
-        if (ancestors.has(current)) {
-            throw strictJsonValidationError(
-                context,
-                "cyclic_value",
-                `${context.label} contains a cyclic reference at ${path}`,
-                path
-            );
-        }
-
-        ancestors.add(current);
-        try {
-            if (Array.isArray(current)) {
-                const keys = Reflect.ownKeys(current);
-                if (
-                    keys.length !== current.length + 1 ||
-                    keys.some(
-                        (key) =>
-                            key !== "length" &&
-                            (typeof key !== "string" ||
-                                !/^(0|[1-9]\d*)$/.test(key) ||
-                                Number(key) >= current.length)
-                    )
-                ) {
-                    throw strictJsonValidationError(
-                        context,
-                        "unsupported_object",
-                        `${context.label} contains a non-JSON array property at ${path}`,
-                        path
-                    );
-                }
-                for (let index = 0; index < current.length; index++) {
-                    const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
-                    if (
-                        descriptor === undefined ||
-                        !descriptor.enumerable ||
-                        !("value" in descriptor)
-                    ) {
-                        throw strictJsonValidationError(
-                            context,
-                            "unsupported_object",
-                            `${context.label} contains a non-JSON array property at ${path}[${index}]`,
-                            `${path}[${index}]`
-                        );
-                    }
-                    visit(descriptor.value, `${path}[${index}]`, false);
-                }
-                return;
-            }
-
-            const prototype = Object.getPrototypeOf(current);
-            if (prototype !== Object.prototype && prototype !== null) {
-                throw strictJsonValidationError(
-                    context,
-                    "unsupported_object",
-                    `${context.label} contains a non-JSON object at ${path}`,
-                    path
-                );
-            }
-            for (const key of Reflect.ownKeys(current)) {
-                if (typeof key === "symbol") {
-                    throw strictJsonValidationError(
-                        context,
-                        "unsupported_type",
-                        `${context.label} contains a function, symbol, or BigInt at ${path}`,
-                        path
-                    );
-                }
-                const propertyPath = /^[A-Za-z_$][\w$]*$/.test(key)
-                    ? `${path}.${key}`
-                    : `${path}[${JSON.stringify(key)}]`;
-                const descriptor = Object.getOwnPropertyDescriptor(current, key);
-                if (
-                    descriptor === undefined ||
-                    !descriptor.enumerable ||
-                    !("value" in descriptor)
-                ) {
-                    throw strictJsonValidationError(
-                        context,
-                        "unsupported_object",
-                        `${context.label} contains a non-JSON property at ${propertyPath}`,
-                        propertyPath
-                    );
-                }
-                visit(descriptor.value, propertyPath, false);
-            }
-        } finally {
-            ancestors.delete(current);
-        }
-    };
-
-    visit(value, "$", context.allowTopLevelUndefined);
-}
-
-function assertWorkflowResult(value: unknown): asserts value is JsonValue | undefined {
-    assertStrictJson(value, {
-        code: "workflow_result_not_json",
-        label: "Workflow result",
-        allowTopLevelUndefined: true,
-    });
-}
-
-function assertWorkflowStepResult(value: unknown, key: string): asserts value is JsonValue {
-    assertStrictJson(value, {
-        code: "workflow_step_not_json",
-        label: `Workflow step "${key}" result`,
-        allowTopLevelUndefined: false,
-    });
 }

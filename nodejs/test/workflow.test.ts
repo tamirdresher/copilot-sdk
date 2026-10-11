@@ -7,6 +7,7 @@ import { ErrorCodes, ResponseError } from "vscode-jsonrpc/node.js";
 import { CopilotClient } from "../src/client.js";
 import { CopilotSession } from "../src/session.js";
 import { defineWorkflow } from "../src/workflow.js";
+import type { WorkflowExecutor } from "../src/workflow-executor.js";
 
 function runUpdatedEvent(runId: string, revision: number): Record<string, unknown> {
     return {
@@ -125,12 +126,15 @@ describe("dynamic workflows", () => {
             }
             throw new Error(`Unexpected method: ${method}`);
         });
+        const workflowExecutor: WorkflowExecutor = {
+            execute: vi.fn(async () => ({ result: "durable" })),
+        };
         (client as never as { connection: unknown }).connection = { sendRequest };
 
         await client.resumeSessionForExtension(
             "session-workflow-registration",
             { onPermissionRequest: () => ({ kind: "approved" }) },
-            { workflows: [workflow] }
+            { workflows: [workflow], workflowExecutor }
         );
 
         const payload = sendRequest.mock.calls.find(
@@ -140,6 +144,59 @@ describe("dynamic workflows", () => {
         };
         expect(payload.workflows).toEqual([workflow.meta]);
         expect(payload.workflows?.[0]).not.toHaveProperty("run");
+        expect(payload).not.toHaveProperty("workflowExecutor");
+        expect(workflowExecutor.execute).not.toHaveBeenCalled();
+    });
+
+    it("binds activity dispatch to the current attempt without putting its token in durable input", async () => {
+        const run = vi.fn(async () => "must not run locally");
+        const workflow = defineWorkflow({
+            meta: { name: "bound", description: "Bound workflow", phases: [] },
+            run,
+        });
+        const sendRequest = vi.fn(async (method: string) => {
+            if (method !== "session.workflow.agent") throw new Error(`Unexpected RPC: ${method}`);
+            return { result: "reviewed" };
+        });
+        const session = new CopilotSession("bound-session", { sendRequest } as never);
+        const step = vi.fn(() => 7);
+        const executor: WorkflowExecutor = {
+            execute: async (_definition, invocation, host, signal) => {
+                expect(invocation).toEqual({
+                    scopeId: session.sessionId,
+                    runId: "bound-run",
+                    args: { path: "src" },
+                });
+                expect(signal.aborted).toBe(false);
+                await host.step({ ...invocation, operationId: "step:0" }, "prepare", step);
+                return {
+                    result: await host.agent({ ...invocation, operationId: "agent:1" }, "Review", {
+                        label: "reviewer",
+                    }),
+                };
+            },
+        };
+        session.registerWorkflows([workflow], executor);
+        for (const executionToken of ["attempt-1", "attempt-2"]) {
+            await expect(
+                session.clientSessionApis.workflow!.execute({
+                    sessionId: session.sessionId,
+                    name: "bound",
+                    runId: "bound-run",
+                    executionToken,
+                    args: { path: "src" },
+                })
+            ).resolves.toEqual({ result: "reviewed" });
+            expect(sendRequest).toHaveBeenLastCalledWith("session.workflow.agent", {
+                sessionId: session.sessionId,
+                workflowRunId: "bound-run",
+                executionToken,
+                prompt: "Review",
+                opts: { label: "reviewer" },
+            });
+        }
+        expect(run).not.toHaveBeenCalled();
+        expect(step).toHaveBeenCalledTimes(2);
     });
 
     it("uses workflow-specific validation errors", async () => {

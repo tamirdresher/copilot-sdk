@@ -103,9 +103,11 @@ import type {
 } from "./types.js";
 import { defaultJoinSessionPermissionHandler } from "./types.js";
 import type { WorkflowHandle } from "./workflow.js";
+import type { WorkflowExecutor } from "./workflow-executor.js";
 
 interface ExtensionOrchestrationContributions {
     workflows?: WorkflowHandle[];
+    workflowExecutor?: WorkflowExecutor;
 }
 
 /**
@@ -2003,7 +2005,7 @@ export class CopilotClient {
         contributions: ExtensionOrchestrationContributions = {},
         extensionOptions?: ExtensionJoinOptions
     ): Promise<CopilotSession> {
-        const { workflows } = contributions;
+        const { workflows, workflowExecutor } = contributions;
         if (config.gitHubToken !== undefined && config.gitHubTokenProvider !== undefined) {
             throw new Error("gitHubToken and gitHubTokenProvider are mutually exclusive");
         }
@@ -2027,7 +2029,7 @@ export class CopilotClient {
         session.registerTools(config.tools);
         session.registerCanvases(config.canvases);
         session.registerCommands(config.commands);
-        session.registerWorkflows(workflows);
+        session.registerWorkflows(workflows, workflowExecutor);
         const {
             wireProvider: bearerWireProvider,
             wireProviders: bearerWireProviders,
