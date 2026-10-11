@@ -1858,6 +1858,23 @@ export class CopilotSession {
                                             assertWorkflowStepResult(value, key);
                                             return value;
                                         },
+                                        progress: async (_invocation, event) => {
+                                            await awaitWorkflowOperation(
+                                                () =>
+                                                    self.rpc.workflow.log({
+                                                        runId: params.runId,
+                                                        executionToken: params.executionToken,
+                                                        lines: [
+                                                            {
+                                                                seq: event.sequence,
+                                                                kind: event.kind,
+                                                                text: event.text,
+                                                            },
+                                                        ],
+                                                    }),
+                                                controller.signal
+                                            );
+                                        },
                                     },
                                     controller.signal
                                 );

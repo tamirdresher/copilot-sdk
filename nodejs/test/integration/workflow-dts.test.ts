@@ -12,7 +12,7 @@ import { Metadata } from "@grpc/grpc-js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,9 @@ import { expect, it } from "vitest";
 
 const nodeRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const fixture = fileURLToPath(new URL("../e2e/fixtures/workflow-dts-worker.mjs", import.meta.url));
+const parallelFixture = fileURLToPath(
+    new URL("../e2e/fixtures/workflow-dts-parallel-worker.mjs", import.meta.url)
+);
 const image =
     "mcr.microsoft.com/dts/dts-emulator@sha256:361323065a608d605f9d3ae56b854eb11f1c47fcc16845a37f948f03ca9c5fac";
 
@@ -49,8 +52,10 @@ async function killOwned(child: ChildProcess): Promise<void> {
     await waitFor(() => child.exitCode !== null || child.signalCode !== null, "worker exit");
 }
 
-it("recovers the same scheduler instance in an independent cold worker", async () => {
-    const directory = await mkdtemp(join(nodeRoot, ".dts-restart-"));
+async function proveRestart(scenario: "sequential" | "published-parallel"): Promise<void> {
+    const artifactRoot = resolve(process.env.COPILOT_DTS_TEST_ARTIFACT_DIR ?? nodeRoot);
+    await mkdir(artifactRoot, { recursive: true });
+    const directory = await mkdtemp(join(artifactRoot, ".dts-restart-"));
     const runId = randomUUID();
     const containerName = `copilot-sdk-dts-${runId}`;
     let containerId: string | undefined;
@@ -58,10 +63,20 @@ it("recovers the same scheduler instance in an independent cold worker", async (
     const children: ChildProcess[] = [];
     let childOutput = "";
     const start = (endpoint: string, mode: string): ChildProcess => {
-        const child = spawn(process.execPath, [fixture, endpoint, directory, runId, mode], {
-            cwd: nodeRoot,
-            stdio: ["ignore", "pipe", "pipe"],
-        });
+        const child = spawn(
+            process.execPath,
+            [
+                scenario === "sequential" ? fixture : parallelFixture,
+                endpoint,
+                directory,
+                runId,
+                mode,
+            ],
+            {
+                cwd: nodeRoot,
+                stdio: ["ignore", "pipe", "pipe"],
+            }
+        );
         children.push(child);
         child.stdout?.on("data", (data) => {
             childOutput += String(data);
@@ -130,7 +145,17 @@ it("recovers the same scheduler instance in an independent cold worker", async (
         }
         const firstWorker = start(endpoint, "park");
         await waitFor(() => observed("ready-park.json"), "worker A ready");
-        await waitFor(() => observed("second-park.json"), "second activity entered in worker A");
+        if (scenario === "sequential") {
+            await waitFor(
+                () => observed("second-park.json"),
+                "second activity entered in worker A"
+            );
+        } else {
+            await waitFor(
+                () => observed("slow-park-started.json") && observed("fast-park-started.json"),
+                "both distinct parallel agent activities entered before either finishes"
+            );
+        }
         const readyA = JSON.parse(readFileSync(join(directory, "ready-park.json"), "utf8"));
         expect(readyA.pid).toBe(firstWorker.pid);
         if (typeof readyA.instanceId !== "string")
@@ -140,16 +165,35 @@ it("recovers the same scheduler instance in an independent cold worker", async (
         const agents = before.filter(
             (event) =>
                 event.type === HistoryEventType.TaskScheduled &&
-                event.name === "copilot.workflow.agent.v1"
+                event.name === "copilot.workflow.agent.v2"
         );
         expect(agents).toHaveLength(2);
-        expect(
-            before.some(
-                (event) =>
-                    event.type === HistoryEventType.TaskCompleted &&
-                    event.taskScheduledId === agents[0].eventId
-            )
-        ).toBe(true);
+        if (scenario === "published-parallel") {
+            expect(
+                before.filter(
+                    (event) =>
+                        event.type === HistoryEventType.TaskCompleted &&
+                        agents.some((agent) => event.taskScheduledId === agent.eventId)
+                )
+            ).toHaveLength(0);
+            await writeFile(join(directory, "release-fast"), "release");
+            await waitFor(async () => {
+                const events = await scheduler.getOrchestrationHistory(instanceId);
+                return events.some(
+                    (event) =>
+                        event.type === HistoryEventType.TaskCompleted &&
+                        event.taskScheduledId === agents[1].eventId
+                );
+            }, "fast branch completion recorded while slow branch is still pending");
+        } else {
+            expect(
+                before.some(
+                    (event) =>
+                        event.type === HistoryEventType.TaskCompleted &&
+                        event.taskScheduledId === agents[0].eventId
+                )
+            ).toBe(true);
+        }
         const firstCompletion = before.findIndex(
             (event) =>
                 event.type === HistoryEventType.TaskCompleted &&
@@ -159,7 +203,7 @@ it("recovers the same scheduler instance in an independent cold worker", async (
             (event) =>
                 event.eventId === agents[1].eventId && event.type === HistoryEventType.TaskScheduled
         );
-        expect(firstCompletion).toBeLessThan(secondSchedule);
+        if (scenario === "sequential") expect(firstCompletion).toBeLessThan(secondSchedule);
         await killOwned(firstWorker);
         const secondWorker = start(endpoint, "complete");
         await waitFor(() => observed("ready-complete.json"), "worker B ready");
@@ -170,44 +214,103 @@ it("recovers the same scheduler instance in an independent cold worker", async (
         expect(readyB.pid).not.toBe(readyA.pid);
         expect(readyB.instanceId).toBe(instanceId);
         const completed = JSON.parse(readFileSync(join(directory, "completed.json"), "utf8"));
+        const expected =
+            scenario === "sequential"
+                ? {
+                      first: { value: 7 },
+                      second: { verified: true, input: { first: { value: 7 } } },
+                  }
+                : {
+                      reviews: [
+                          { file: "slow.js", review: "slow reviewed" },
+                          { file: "fast.js", review: "fast reviewed" },
+                      ],
+                  };
         expect(completed).toEqual({
             instanceId,
-            result: {
-                first: { value: 7 },
-                second: { verified: true, input: { first: { value: 7 } } },
-            },
+            result: expected,
         });
         const records: Array<{ stage: string; operationId: string; workerPid: number }> =
             readFileSync(join(directory, "activities.jsonl"), "utf8")
                 .trim()
                 .split("\n")
                 .map((line) => JSON.parse(line));
-        expect(records.filter((record) => record.stage === "first")).toHaveLength(1);
-        const second = records.filter((record) => record.stage === "second");
+        const singleStage = scenario === "sequential" ? "first" : "fast";
+        const retriedStage = scenario === "sequential" ? "second" : "slow";
+        expect(records.filter((record) => record.stage === singleStage)).toHaveLength(1);
+        const second = records.filter((record) => record.stage === retriedStage);
         expect(second).toHaveLength(2);
         expect(second[0].operationId).toBe(second[1].operationId);
         expect(second[0].workerPid).toBe(readyA.pid);
         expect(second[1].workerPid).toBe(readyB.pid);
         expect(records.filter((record) => record.stage === "report")).toHaveLength(1);
-        const parked = JSON.parse(readFileSync(join(directory, "second-park.json"), "utf8"));
-        const recovered = JSON.parse(readFileSync(join(directory, "second-complete.json"), "utf8"));
+        const parked = JSON.parse(
+            readFileSync(
+                join(
+                    directory,
+                    scenario === "sequential" ? "second-park.json" : "slow-park-started.json"
+                ),
+                "utf8"
+            )
+        );
+        const recovered = JSON.parse(
+            readFileSync(
+                join(
+                    directory,
+                    scenario === "sequential"
+                        ? "second-complete.json"
+                        : "slow-complete-started.json"
+                ),
+                "utf8"
+            )
+        );
         expect(recovered).toEqual(parked);
+        const finalHistory = await scheduler.getOrchestrationHistory(instanceId);
+        let progress: unknown;
+        if (scenario === "published-parallel") {
+            const fastCompletion = finalHistory.findIndex(
+                (event) =>
+                    event.type === HistoryEventType.TaskCompleted &&
+                    event.taskScheduledId === agents[1].eventId
+            );
+            const slowCompletion = finalHistory.findIndex(
+                (event) =>
+                    event.type === HistoryEventType.TaskCompleted &&
+                    event.taskScheduledId === agents[0].eventId
+            );
+            expect(fastCompletion).toBeLessThan(slowCompletion);
+            expect(secondSchedule).toBeLessThan(fastCompletion);
+            const lines = readFileSync(join(directory, "progress.jsonl"), "utf8")
+                .trim()
+                .split("\n")
+                .map((line) => JSON.parse(line));
+            expect(lines.map(({ sequence, kind, text }) => ({ sequence, kind, text }))).toEqual([
+                { sequence: 0, kind: "phase", text: "Review" },
+                { sequence: 1, kind: "phase", text: "Verify" },
+                { sequence: 2, kind: "log", text: `Completed workflow run ${runId}` },
+            ]);
+            expect(new Set(lines.map((line) => line.eventId)).size).toBe(3);
+            progress = lines;
+        }
         const state = await scheduler.getOrchestrationState(instanceId, true);
         expect(state?.runtimeStatus).toBe(OrchestrationStatus.COMPLETED);
         console.log(
             "DTS_RESTART_PROOF",
             JSON.stringify({
                 image,
+                scenario,
                 containerId,
                 instanceId,
                 workerA: readyA.pid,
                 workerB: readyB.pid,
-                firstActivityExecutions: records.filter((record) => record.stage === "first")
+                recordedActivityStage: singleStage,
+                firstActivityExecutions: records.filter((record) => record.stage === singleStage)
                     .length,
                 secondActivityExecutions: second.length,
                 reportActivityExecutions: records.filter((record) => record.stage === "report")
                     .length,
                 operationIds: records.map(({ stage, operationId }) => ({ stage, operationId })),
+                progress,
                 output: completed.result,
                 schedulerKeptAlive: true,
                 host: "deterministic fixture (no live model)",
@@ -219,7 +322,13 @@ it("recovers the same scheduler instance in an independent cold worker", async (
         for (const child of children) await killOwned(child);
         await client?.stop();
         if (containerId) docker("stop", "--time", "5", containerId);
-        if (dirname(directory) !== nodeRoot) throw new Error("Unexpected test cleanup directory");
+        if (dirname(directory) !== artifactRoot)
+            throw new Error("Unexpected test cleanup directory");
         await rm(directory, { recursive: true, force: true });
     }
-});
+}
+
+it.each(["sequential", "published-parallel"] as const)(
+    "recovers the same %s scheduler instance in an independent cold worker",
+    proveRestart
+);

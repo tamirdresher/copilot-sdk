@@ -264,8 +264,8 @@ Revisions cover durable lifecycle, accounting, phase, agent, and progress change
 
 The experimental `@github/copilot-sdk/workflow-dts` entry point adds a Durable
 Task Scheduler (DTS) execution provider. It preserves `defineWorkflow` and
-ordinary `async run(ctx)` bodies, but supports a deliberately restricted
-sequential-effects profile. Omitting the provider preserves all existing local
+ordinary `async run(ctx)` bodies, including the published `review-changed`
+example, with a deliberately restricted effects profile. Omitting the provider preserves all existing local
 workflow behavior described above.
 
 > [!WARNING]
@@ -282,7 +282,8 @@ This draft does not provision Azure resources or implement that service.
 
 ### Authoring and host binding
 
-An existing `.mjs` workflow can use sequential awaited agents and steps:
+An existing `.mjs` workflow can use awaited agents, journaled steps, and
+top-level `ctx.parallel()`:
 
 ```js
 import { defineWorkflow } from "@github/copilot-sdk/extension";
@@ -346,6 +347,8 @@ import type {
     JsonValue,
     WorkflowActivityInvocation,
     WorkflowAgentOptions,
+    WorkflowInvocation,
+    WorkflowProgressEvent,
 } from "@github/copilot-sdk";
 
 interface WorkflowExecutionHost {
@@ -359,6 +362,10 @@ interface WorkflowExecutionHost {
         key: string,
         producer: () => JsonValue | Promise<JsonValue>,
     ): Promise<JsonValue>;
+    progress?(
+        invocation: WorkflowInvocation,
+        event: WorkflowProgressEvent,
+    ): Promise<void>;
 }
 ```
 
@@ -369,6 +376,13 @@ A local step host executes `producer()` and returns its JSON result. A future
 sandbox/cloud host must load the pinned artifact and reconstruct the operation
 there, not serialize the closure. Scheduler history and execution location are
 separate responsibilities.
+
+Progress events carry a stable `eventId`, ordered `sequence`, `kind` (`phase`
+or `log`), and `text`. A workflow using phases or logs requires a progress sink;
+omitting it fails explicitly. Deduplicate redelivery by `eventId` in that sink.
+The native session binding sends progress with the current execution token and
+stable sequence; a managed cross-process sink still needs durable idempotency.
+This is not an exactly-once guarantee for an arbitrary external sink.
 
 The existing extension registration path also accepts
 `joinSession({ workflows: [review], workflowExecutor: executor })`. The binding
@@ -389,6 +403,22 @@ throwing a suspension exception through the author's `catch` or `finally`.
 DTS then schedules a separate **ExecuteAgent** or **ExecuteStep** activity and
 records its outcome before scheduling the next Advance.
 
+For `ctx.parallel(thunks)`, Advance discovers one effect frontier per branch.
+DTS schedules all distinct frontier activities before awaiting any completion;
+it does not execute the thunks serially inside a long activity. The orchestrator
+records actual completion order and per-branch histories while preserving input
+array order in the returned results. Replaying branch promises uses that
+recorded completion order. A branch can contain sequential agent/step calls;
+this profile drains a frontier round before discovering the next round, so it
+does not implement the barrier-free `pipeline` helper. Duplicate agent calls or
+step keys share one scheduled effect, including within a parallel round.
+
+`ctx.phase()` and `ctx.log()` remain void-returning author APIs. Advance collects
+their ordered metadata without emitting it during replay. Separate **Progress**
+activities deliver new records before the next effects, and deliver the final
+log before the run completes. Root progress is replay-validated and durable;
+progress from competing branches or inside step producers remains unsupported.
+
 ExecuteStep replays the same prefix to recreate the producer at its operation
 locator. It captures prior recorded JSON values again; it does not persist a
 JavaScript heap. Captures must be reproducible from immutable code, invocation
@@ -404,6 +434,9 @@ rejections, not converted to `null` or memoized as successful results.
 JSON-RPC failures retain their name, message, numeric code, and JSON data.
 Other errors retain name/message, not custom prototypes or stacks; JSON-valued
 rejections retain their value.
+An ordinary thrown parallel-branch error becomes `null`; hard JSON-RPC,
+connection, and cancellation failures propagate. Already-admitted parallel
+activities are drained before propagation rather than silently orphaned.
 
 Activities are **at-least-once**, not exactly-once side effects. Losing a worker
 after an effect but before DTS acknowledges its completion can repeat it.
@@ -414,13 +447,15 @@ This draft does not provide tenant isolation.
 
 ### Supported subset and lifecycle boundaries
 
-Only sequential, awaited `ctx.agent()` and journaled `ctx.step()` are supported.
-`ctx.parallel`, `ctx.pipeline`, `ctx.pause`, `ctx.phase`, `ctx.log`, nested
-workflows, `ctx.session`, volatile steps, and effects nested inside producers
+Awaited `ctx.agent()`, journaled `ctx.step()`, top-level `ctx.parallel()`, and
+root `ctx.phase()`/`ctx.log()` are supported. `ctx.pipeline`, `ctx.pause`, nested
+parallel/workflows, `ctx.session`, volatile steps, and effects nested inside producers
 fail explicitly. Concurrent/unawaited SDK calls and competing SDK calls through
 raw `Promise.all`/`Promise.race` are rejected; arbitrary JavaScript race semantics
 are not implemented. Profile violations cannot be made valid by catching them.
 Declared resource limits reject registration until native accounting is wired.
+The v2 driver/activity protocol pins these history semantics. It does not
+replay an existing v1 instance as v2: an incompatible instance/artifact rejects.
 
 The body outside producers must be pure and deterministic. Put I/O in a step
 producer or the execution host. Replay diagnoses new async resources and waits
@@ -476,13 +511,13 @@ Supply an existing Node.js 20.19.0 binary; this check does not install runtimes:
 npm --prefix .\nodejs run test:workflow-node20 -- "C:\toolchains\node20\node.exe"
 ```
 
-The test creates one uniquely named emulator container with loopback-only
+The tests create uniquely named emulator containers with loopback-only
 dynamic ports. It uses the `default` task hub and no authentication, and records
 the pinned image digest in its proof output. No Azure resources are provisioned.
 It fails if Docker/emulator execution is unavailable; it does not substitute a
 mock backend. The default Node suite does not start this container.
 
-Worker A completes an agent activity and enters a second one. The test verifies
+The sequential scenario completes an agent activity and enters a second one. The test verifies
 the first completion in real DTS history, kills only worker A's owned PID,
 and starts an independently loaded worker B against the still-running scheduler.
 It asserts the same instance ID, exactly one execution of the first activity,
@@ -493,6 +528,33 @@ The host is a deterministic fixture, not a live Copilot model. Separate in-memor
 tests cover replay/dispatch semantics; they are not restart evidence.
 This proves worker recovery, not scheduler-container restart or disk-loss
 recovery.
+
+The published-example scenario loads
+[`samples/review-changed.mjs`](../samples/review-changed.mjs) with the exact
+metadata and body from the first example above. Two gated, distinct agent
+activities must both enter before either finishes. The later input branch
+finishes first; a cold worker then resumes the other branch without rerunning
+the recorded one. The test asserts completion order, input-order results,
+report-producer reconstruction, both phase records, and the final log.
+The gates are test-only execution-host behavior, not a change to author code.
+For this published example, the **Verify** phase contains a report step;
+it is not an additional AI verification call.
+
+To opt the unchanged example into a native extension, import both the sample
+and `joinSession` from the same built SDK module graph, construct the
+runtime-owned `DtsWorkflowExecutor`, and call:
+
+```js
+const session = await joinSession({
+    workflows: [reviewChanged],
+    workflowExecutor: executor,
+});
+```
+
+The scoped developer demonstration uses that native workflow callback path
+and a local emulator. It does not change the installed CLI's authoring tool,
+or make DTS the default backend. A headless execution host is still an option;
+its model/session lifecycle must be distinguished from native workflow agents.
 
 Before release, reconcile this standalone SDK draft into the runtime
 repository's `src/sdk`; the runtime release snapshot owns the published tree.

@@ -16,6 +16,7 @@ import {
     recordWorkflowFailure,
     replayWorkflow,
     type WorkflowHistoryEntry,
+    type WorkflowParallelHistory,
 } from "../src/workflow-replay.js";
 
 const invocation = { scopeId: "scope", runId: "run", args: { input: 7 } };
@@ -168,35 +169,17 @@ describe("sequential async workflow replay (no scheduler)", () => {
         ).rejects.toMatchObject({ code: "workflow_replay_diverged" });
     });
 
-    it.each([
-        "parallel",
-        "pipeline",
-        "pause",
-        "phase",
-        "log",
-        "workflow",
-        "session",
-        "signal",
-    ] as const)(
+    it.each(["pipeline", "pause", "workflow", "session", "signal"] as const)(
         "fails closed for unsupported %s even when the body catches it",
         async (operation) => {
             const workflow = definition(async (ctx) => {
                 try {
                     switch (operation) {
-                        case "parallel":
-                            await ctx.parallel([]);
-                            break;
                         case "pipeline":
                             await ctx.pipeline([]);
                             break;
                         case "pause":
                             await ctx.pause("key");
-                            break;
-                        case "phase":
-                            ctx.phase("title");
-                            break;
-                        case "log":
-                            ctx.log("text");
                             break;
                         case "workflow":
                             await ctx.workflow("nested");
@@ -218,6 +201,184 @@ describe("sequential async workflow replay (no scheduler)", () => {
             });
         }
     );
+
+    it("discovers parallel effects without entering catch/finally and replays actual completion order", async () => {
+        const caught = vi.fn();
+        const final = vi.fn();
+        const workflow = definition(async (ctx) => {
+            const seen: string[] = [];
+            try {
+                return await ctx.parallel(
+                    ["left", "right"].map((side) => async () => {
+                        const value = json(await ctx.agent(side, { label: side }));
+                        seen.push(side);
+                        return { value, seen: [...seen] };
+                    })
+                );
+            } catch {
+                caught();
+                return null;
+            } finally {
+                final();
+            }
+        });
+        const initial = await replayWorkflow(workflow, invocation, []);
+        expect(initial.turn.status).toBe("parallel");
+        if (initial.turn.status !== "parallel") throw new Error("Missing parallel turn");
+        const commands = initial.turn.branches.map((branch) => {
+            if (branch.status !== "command") throw new Error("Missing branch command");
+            return branch.command;
+        });
+        expect(commands.map((command) => command.kind)).toEqual(["agent", "agent"]);
+        expect(caught).not.toHaveBeenCalled();
+        expect(final).not.toHaveBeenCalled();
+        const parallel: WorkflowParallelHistory = {
+            branches: commands.map((command, branch) => [
+                { command, outcome: { status: "fulfilled", value: branch } },
+            ]),
+            completionOrder: [
+                { branch: 1, index: 0 },
+                { branch: 0, index: 0 },
+            ],
+        };
+        const next = await replayWorkflow(workflow, invocation, [], undefined, parallel);
+        if (next.turn.status !== "parallel") throw new Error("Missing parallel replay");
+        expect(next.turn.branches).toEqual([
+            { status: "completed", result: { value: 0, seen: ["right", "left"] } },
+            { status: "completed", result: { value: 1, seen: ["right"] } },
+        ]);
+        expect(final).not.toHaveBeenCalled();
+        const values = next.turn.branches.map((branch) => {
+            if (branch.status !== "completed") throw new Error("Incomplete branch");
+            return branch.result;
+        });
+        expect(
+            (
+                await replayWorkflow(workflow, invocation, [
+                    {
+                        command: initial.turn.command,
+                        outcome: { status: "fulfilled", value: values },
+                        parallel,
+                    },
+                ])
+            ).turn
+        ).toEqual({ status: "completed", result: values });
+        expect(final).toHaveBeenCalledOnce();
+    });
+
+    it("collects root progress including the final log without changing phase/log's void API", async () => {
+        const workflow = definition(async (ctx) => {
+            expect(ctx.phase("Review")).toBeUndefined();
+            await ctx.agent("review");
+            ctx.phase("Verify");
+            ctx.log("Finished");
+            return null;
+        });
+        const first = await replayWorkflow(workflow, invocation, []);
+        if (first.turn.status !== "command") throw new Error("Missing command");
+        expect(first.turn.progress).toEqual([{ sequence: 0, kind: "phase", text: "Review" }]);
+        const next = await replayWorkflow(workflow, invocation, [
+            { command: first.turn.command, outcome: { status: "fulfilled", value: "reviewed" } },
+        ]);
+        expect(next.turn).toEqual({
+            status: "completed",
+            result: null,
+            progress: [
+                { sequence: 0, kind: "phase", text: "Review" },
+                { sequence: 1, kind: "phase", text: "Verify" },
+                { sequence: 2, kind: "log", text: "Finished" },
+            ],
+        });
+    });
+
+    it.each(["nested parallel", "branch progress", "producer progress"] as const)(
+        "rejects unsupported %s without letting user catch bypass the profile",
+        async (operation) => {
+            const workflow = definition(async (ctx) => {
+                if (operation === "producer progress") {
+                    return await ctx.step("progress", () => {
+                        try {
+                            ctx.log("not allowed");
+                        } catch {
+                            return null;
+                        }
+                        return null;
+                    });
+                }
+                return await ctx.parallel([
+                    async () => {
+                        try {
+                            if (operation === "nested parallel") return await ctx.parallel([]);
+                            ctx.phase("not allowed");
+                        } catch {
+                            return null;
+                        }
+                        return null;
+                    },
+                ]);
+            });
+            if (operation === "producer progress") {
+                const capture = await replayWorkflow(workflow, invocation, []);
+                await expect(capture.producer?.()).rejects.toMatchObject({
+                    code: "workflow_effect_unsupported",
+                });
+            } else {
+                await expect(replayWorkflow(workflow, invocation, [])).rejects.toMatchObject({
+                    code: "workflow_effect_unsupported",
+                });
+            }
+        }
+    );
+
+    it("distinguishes ordinary branch throws from fatal runtime errors", async () => {
+        const workflow = definition(async (ctx) =>
+            ctx.parallel([
+                () => {
+                    throw new Error("ordinary");
+                },
+                () => {
+                    throw new ResponseError(-32603, "fatal", { code: "limit" });
+                },
+            ])
+        );
+        const result = await replayWorkflow(workflow, invocation, []);
+        if (result.turn.status !== "parallel") throw new Error("Missing parallel turn");
+        expect(result.turn.branches[0]).toEqual({ status: "completed", result: null });
+        expect(result.turn.branches[1]).toMatchObject({
+            status: "failed",
+            error: { kind: "error", rpcCode: -32603, data: { code: "limit" } },
+        });
+    });
+
+    it("rejects missing or duplicated completion history", async () => {
+        const workflow = definition(async (ctx) =>
+            ctx.parallel([async () => json(await ctx.agent("one"))])
+        );
+        const initial = await replayWorkflow(workflow, invocation, []);
+        if (initial.turn.status !== "parallel" || initial.turn.branches[0].status !== "command") {
+            throw new Error("Missing branch frontier");
+        }
+        const branch = [
+            {
+                command: initial.turn.branches[0].command,
+                outcome: { status: "fulfilled" as const, value: 1 },
+            },
+        ];
+        for (const completionOrder of [
+            [],
+            [
+                { branch: 0, index: 0 },
+                { branch: 0, index: 0 },
+            ],
+        ]) {
+            await expect(
+                replayWorkflow(workflow, invocation, [], undefined, {
+                    branches: [branch],
+                    completionOrder,
+                })
+            ).rejects.toMatchObject({ code: "workflow_replay_diverged" });
+        }
+    });
 
     it("rejects volatile and nested producer effects", async () => {
         await expect(

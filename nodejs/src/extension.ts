@@ -17,6 +17,7 @@ export type {
     WorkflowExecutionHost,
     WorkflowExecutor,
     WorkflowInvocation,
+    WorkflowProgressEvent,
 } from "./workflow-executor.js";
 
 export {

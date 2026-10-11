@@ -4,8 +4,9 @@
 
 import {
     OrchestrationStatus,
+    Task,
+    whenAny,
     type OrchestrationContext,
-    type Task,
     type TaskHubGrpcClient,
     type TaskHubGrpcWorker,
 } from "@microsoft/durabletask-js";
@@ -22,18 +23,21 @@ import {
     type WorkflowExecutionHost,
     type WorkflowExecutor,
     type WorkflowInvocation,
+    type WorkflowProgressEvent,
 } from "./workflow-executor.js";
 import { assertWorkflowResult, assertWorkflowStepResult } from "./workflow-json.js";
 import {
     canonicalWorkflowJson,
+    isWorkflowFailureFatal,
     recordWorkflowFailure,
     replayWorkflow,
     workflowHash,
     WorkflowReplayError,
-    type WorkflowCommand,
+    type WorkflowEffectCommand,
     type WorkflowHistoryEntry,
     type WorkflowOutcome,
     type WorkflowReplayTurn,
+    type WorkflowParallelHistory,
 } from "./workflow-replay.js";
 
 export { WorkflowReplayError } from "./workflow-replay.js";
@@ -42,12 +46,14 @@ export type {
     WorkflowExecutionHost,
     WorkflowExecutor,
     WorkflowInvocation,
+    WorkflowProgressEvent,
 } from "./workflow-executor.js";
 
-const ORCHESTRATOR = "copilot.workflow.async.v1";
-const ADVANCE = "copilot.workflow.advance.v1";
-const EXECUTE_AGENT = "copilot.workflow.agent.v1";
-const EXECUTE_STEP = "copilot.workflow.step.v1";
+const ORCHESTRATOR = "copilot.workflow.async.v2";
+const ADVANCE = "copilot.workflow.advance.v2";
+const EXECUTE_AGENT = "copilot.workflow.agent.v2";
+const EXECUTE_STEP = "copilot.workflow.step.v2";
+const PROGRESS = "copilot.workflow.progress.v2";
 
 interface PinnedInvocation extends WorkflowInvocation {
     name: string;
@@ -57,10 +63,18 @@ interface PinnedInvocation extends WorkflowInvocation {
 interface ReplayRequest {
     input: PinnedInvocation;
     history: WorkflowHistoryEntry[];
+    parallel?: WorkflowParallelHistory;
 }
 
 interface ActivityRequest extends ReplayRequest {
-    command: WorkflowCommand;
+    command: WorkflowEffectCommand;
+    branch?: number;
+    parallelIndex?: number;
+}
+
+interface ProgressRequest {
+    input: PinnedInvocation;
+    event: Omit<WorkflowProgressEvent, "eventId">;
 }
 
 /**
@@ -81,24 +95,203 @@ export interface DtsWorkflowExecutorOptions {
     executionHost?: WorkflowExecutionHost;
 }
 
-function memoIdentity(command: WorkflowCommand): string {
+function memoIdentity(command: WorkflowEffectCommand): string {
     return command.kind === "step"
         ? `step:${command.key}`
         : `agent:${canonicalWorkflowJson({ prompt: command.prompt, options: command.options })}`;
 }
 
+type DriverReply = WorkflowReplayTurn | WorkflowOutcome | Task<WorkflowOutcome> | undefined;
+
+function replayTurn(reply: DriverReply): WorkflowReplayTurn {
+    if (
+        !reply ||
+        reply instanceof Task ||
+        reply.status === "fulfilled" ||
+        reply.status === "rejected"
+    ) {
+        throw new WorkflowReplayError("workflow_replay_diverged", "Invalid replay activity reply");
+    }
+    return reply;
+}
+
+function memoizedEffects(history: WorkflowHistoryEntry[]): Map<string, WorkflowOutcome> {
+    const memo = new Map<string, WorkflowOutcome>();
+    for (const entry of history) {
+        if (entry.parallel) {
+            for (const branch of entry.parallel.branches) {
+                for (const [key, value] of memoizedEffects(branch)) memo.set(key, value);
+            }
+        }
+        if (entry.command.kind !== "parallel" && entry.outcome.status === "fulfilled") {
+            memo.set(memoIdentity(entry.command), entry.outcome);
+        }
+    }
+    return memo;
+}
+
+async function* executeParallel(
+    context: OrchestrationContext,
+    input: PinnedInvocation,
+    history: WorkflowHistoryEntry[],
+    initial: Extract<WorkflowReplayTurn, { status: "parallel" }>
+): AsyncGenerator<Task<unknown>, WorkflowHistoryEntry, DriverReply> {
+    const parallel: WorkflowParallelHistory = {
+        branches: initial.branches.map(() => []),
+        completionOrder: [],
+    };
+    const memo = memoizedEffects(history);
+    let turn = initial;
+    while (true) {
+        const fatal = turn.branches.find((branch) => branch.status === "failed");
+        if (fatal?.status === "failed") {
+            return {
+                command: initial.command,
+                outcome: { status: "rejected", error: fatal.error },
+                parallel,
+            };
+        }
+        if (turn.branches.every((branch) => branch.status === "completed")) {
+            return {
+                command: initial.command,
+                outcome: {
+                    status: "fulfilled",
+                    value: turn.branches.map((branch) => {
+                        if (branch.status !== "completed")
+                            throw new Error("Parallel result is incomplete");
+                        return branch.result;
+                    }),
+                },
+                parallel,
+            };
+        }
+        const pending = new Map<
+            string,
+            {
+                task: Task<WorkflowOutcome>;
+                targets: Array<{ branch: number; command: WorkflowEffectCommand }>;
+            }
+        >();
+        const record = (
+            branch: number,
+            command: WorkflowEffectCommand,
+            outcome: WorkflowOutcome
+        ) => {
+            parallel.branches[branch].push({ command, outcome });
+            parallel.completionOrder.push({ branch, index: command.index });
+        };
+        for (const [branch, state] of turn.branches.entries()) {
+            if (state.status !== "command") continue;
+            const key = memoIdentity(state.command);
+            const hit = memo.get(key);
+            if (hit) {
+                record(branch, state.command, hit);
+                continue;
+            }
+            const shared = pending.get(key);
+            if (shared) {
+                shared.targets.push({ branch, command: state.command });
+                continue;
+            }
+            pending.set(key, {
+                task: context.callActivity<ActivityRequest, WorkflowOutcome>(
+                    state.command.kind === "agent" ? EXECUTE_AGENT : EXECUTE_STEP,
+                    {
+                        input,
+                        history,
+                        command: state.command,
+                        branch,
+                        parallelIndex: initial.command.index,
+                        parallel: structuredClone(parallel),
+                    }
+                ),
+                targets: [{ branch, command: state.command }],
+            });
+        }
+        let failure: WorkflowOutcome | undefined;
+        let taskFailure: Error | undefined;
+        // All distinct effects are scheduled before the first wait. Drain admitted
+        // tasks on failure instead of silently orphaning another parallel branch.
+        while (pending.size > 0) {
+            const winner = yield whenAny([...pending.values()].map(({ task }) => task));
+            if (!(winner instanceof Task)) throw new Error("Invalid parallel completion task");
+            const pair = [...pending.entries()].find(([, item]) => item.task === winner);
+            if (!pair) throw new Error("Unknown parallel completion task");
+            const [key, item] = pair;
+            pending.delete(key);
+            let outcome: WorkflowOutcome;
+            if (winner.isFailed) {
+                taskFailure ??= winner.getException();
+                outcome = {
+                    status: "rejected",
+                    error: recordWorkflowFailure(winner.getException()),
+                };
+            } else {
+                outcome = winner.getResult();
+            }
+            if (outcome.status === "fulfilled") memo.set(key, outcome);
+            else if (isWorkflowFailureFatal(outcome.error)) failure ??= outcome;
+            for (const target of item.targets) record(target.branch, target.command, outcome);
+        }
+        // Provider/profile failures must not become catchable branch outcomes.
+        if (taskFailure) throw taskFailure;
+        if (failure) return { command: initial.command, outcome: failure, parallel };
+        const reply = replayTurn(
+            yield context.callActivity<ReplayRequest, WorkflowReplayTurn>(ADVANCE, {
+                input,
+                history,
+                parallel,
+            })
+        );
+        if (
+            reply.status !== "parallel" ||
+            canonicalWorkflowJson(reply.command) !== canonicalWorkflowJson(initial.command)
+        ) {
+            throw new WorkflowReplayError(
+                "workflow_replay_diverged",
+                "Parallel definition changed"
+            );
+        }
+        turn = reply;
+    }
+}
+
 async function* orchestrate(
     context: OrchestrationContext,
     input: PinnedInvocation
-): AsyncGenerator<Task<unknown>, { result?: JsonValue }, WorkflowReplayTurn | WorkflowOutcome> {
+): AsyncGenerator<Task<unknown>, { result?: JsonValue }, DriverReply> {
     const history: WorkflowHistoryEntry[] = [];
+    const progress: Array<Omit<WorkflowProgressEvent, "eventId">> = [];
     while (true) {
-        const turn = yield context.callActivity<ReplayRequest, WorkflowReplayTurn>(ADVANCE, {
-            input,
-            history,
-        });
+        const turn = replayTurn(
+            yield context.callActivity<ReplayRequest, WorkflowReplayTurn>(ADVANCE, {
+                input,
+                history,
+            })
+        );
+        const lines = turn.progress ?? [];
+        if (
+            lines.length < progress.length ||
+            canonicalWorkflowJson(lines.slice(0, progress.length)) !==
+                canonicalWorkflowJson(progress)
+        ) {
+            throw new WorkflowReplayError(
+                "workflow_replay_diverged",
+                "Workflow progress changed during replay"
+            );
+        }
+        for (const line of lines.slice(progress.length)) {
+            yield context.callActivity<ProgressRequest, void>(PROGRESS, { input, event: line });
+            progress.push(line);
+        }
         if (turn.status === "completed") {
             return turn.result === undefined ? {} : { result: turn.result };
+        }
+        if (turn.status === "parallel") {
+            if (turn.command.index !== history.length)
+                throw new Error("Invalid parallel operation order");
+            history.push(yield* executeParallel(context, input, history, turn));
+            continue;
         }
         if (turn.status !== "command" || turn.command.index !== history.length) {
             throw new WorkflowReplayError(
@@ -106,20 +299,21 @@ async function* orchestrate(
                 "Invalid replay command order"
             );
         }
-        const previous = history.find(
-            (entry) =>
-                entry.outcome.status === "fulfilled" &&
-                memoIdentity(entry.command) === memoIdentity(turn.command)
-        );
+        if (turn.command.kind === "parallel") throw new Error("Missing parallel branch discovery");
+        const previous = memoizedEffects(history).get(memoIdentity(turn.command));
         if (previous) {
-            history.push({ command: turn.command, outcome: previous.outcome });
+            history.push({ command: turn.command, outcome: previous });
             continue;
         }
         const outcome = yield context.callActivity<ActivityRequest, WorkflowOutcome>(
             turn.command.kind === "agent" ? EXECUTE_AGENT : EXECUTE_STEP,
             { input, history, command: turn.command }
         );
-        if (outcome.status !== "fulfilled" && outcome.status !== "rejected") {
+        if (
+            !outcome ||
+            outcome instanceof Task ||
+            (outcome.status !== "fulfilled" && outcome.status !== "rejected")
+        ) {
             throw new WorkflowReplayError("workflow_replay_diverged", "Invalid activity outcome");
         }
         history.push({ command: turn.command, outcome });
@@ -129,7 +323,7 @@ async function* orchestrate(
 /**
  * Executes existing async workflow bodies using real DTS-scheduled activities.
  *
- * Supports sequential awaited agents and journaled step producers. Pure body
+ * Supports sequential effects, top-level parallel branches, and host progress. Pure body
  * code is replayed in an Advance activity, outside the deterministic DTS
  * orchestrator. Step producers are recreated by replaying the pinned prefix in
  * the ExecuteStep activity. See the workflow documentation for restrictions.
@@ -164,7 +358,25 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
         options.worker.addNamedOrchestrator(ORCHESTRATOR, orchestrate);
         options.worker.addNamedActivity(ADVANCE, async (_context, request: ReplayRequest) => {
             const definition = this.definitionFor(request.input);
-            return (await replayWorkflow(definition, request.input, request.history)).turn;
+            return (
+                await replayWorkflow(
+                    definition,
+                    request.input,
+                    request.history,
+                    undefined,
+                    request.parallel
+                )
+            ).turn;
+        });
+        options.worker.addNamedActivity(PROGRESS, async (_context, request: ProgressRequest) => {
+            this.definitionFor(request.input);
+            const host = this.hostFor(request.input);
+            if (!host.progress)
+                throw new Error("Workflow phases/logs require an executionHost.progress sink");
+            await host.progress(this.invocation(request.input), {
+                ...request.event,
+                eventId: `${this.getInstanceId(request.input)}:progress:${request.event.sequence}`,
+            });
         });
         options.worker.addNamedActivity(
             EXECUTE_AGENT,
@@ -193,12 +405,21 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
                     definition,
                     request.input,
                     request.history,
-                    this.bindings.get(this.getInstanceId(request.input))?.signal
+                    this.bindings.get(this.getInstanceId(request.input))?.signal,
+                    request.parallel
                 );
+                const command =
+                    replay.turn.status === "parallel" && request.branch !== undefined
+                        ? replay.turn.branches[request.branch]
+                        : replay.turn;
+                const producer =
+                    request.branch === undefined
+                        ? replay.producer
+                        : replay.parallelProducers?.get(request.branch);
                 if (
-                    replay.turn.status !== "command" ||
-                    !replay.producer ||
-                    canonicalWorkflowJson(replay.turn.command) !==
+                    command?.status !== "command" ||
+                    !producer ||
+                    canonicalWorkflowJson(command.command) !==
                         canonicalWorkflowJson(request.command)
                 ) {
                     throw new WorkflowReplayError(
@@ -208,7 +429,6 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
                 }
                 const host = this.hostFor(request.input);
                 const key = request.command.key;
-                const producer = replay.producer;
                 return this.outcome(async () => {
                     const value = await host.step(this.activityInvocation(request), key, producer);
                     assertWorkflowStepResult(value, key);
@@ -356,14 +576,20 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
 
     private activityInvocation(request: ActivityRequest): WorkflowActivityInvocation {
         return {
-            scopeId: request.input.scopeId,
-            runId: request.input.runId,
-            args: structuredClone(request.input.args),
+            ...this.invocation(request.input),
             operationId: `${this.getInstanceId({
                 scopeId: request.input.scopeId,
                 runId: request.input.runId,
-            })}:${request.command.index}`,
+            })}:${
+                request.branch === undefined
+                    ? request.command.index
+                    : `${request.parallelIndex}/${request.branch}/${request.command.index}`
+            }`,
         };
+    }
+
+    private invocation(input: PinnedInvocation): WorkflowInvocation {
+        return { scopeId: input.scopeId, runId: input.runId, args: structuredClone(input.args) };
     }
 
     private async outcome(producer: () => Promise<JsonValue>): Promise<WorkflowOutcome> {

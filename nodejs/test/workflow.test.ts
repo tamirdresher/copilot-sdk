@@ -236,6 +236,49 @@ describe("dynamic workflows", () => {
         expect(continued).not.toHaveBeenCalled();
     });
 
+    it("delivers durable host progress with stable sequence and the current execution token", async () => {
+        const sendRequest = vi.fn(async () => ({}));
+        const session = new CopilotSession("progress-session", { sendRequest } as never);
+        const flow = defineWorkflow({
+            meta: { name: "progress", description: "Progress", phases: [{ title: "Review" }] },
+            run: async () => null,
+        });
+        const executor: WorkflowExecutor = {
+            execute: async (_definition, invocation, host) => {
+                if (!host.progress) throw new Error("Missing session progress sink");
+                await host.progress(invocation, {
+                    eventId: "progress-run:progress:0",
+                    sequence: 0,
+                    kind: "phase",
+                    text: "Review",
+                });
+                await host.progress(invocation, {
+                    eventId: "progress-run:progress:1",
+                    sequence: 1,
+                    kind: "log",
+                    text: "Complete",
+                });
+                return { result: null };
+            },
+        };
+        session.registerWorkflows([flow], executor);
+        for (const executionToken of ["attempt-1", "attempt-2"]) {
+            await session.clientSessionApis.workflow!.execute({
+                sessionId: session.sessionId,
+                name: "progress",
+                runId: "progress-run",
+                executionToken,
+                args: {},
+            });
+            expect(sendRequest).toHaveBeenLastCalledWith("session.workflow.log", {
+                sessionId: session.sessionId,
+                runId: "progress-run",
+                executionToken,
+                lines: [{ seq: 1, kind: "log", text: "Complete" }],
+            });
+        }
+    });
+
     it("uses workflow-specific validation errors", async () => {
         const workflow = defineWorkflow({
             meta: {

@@ -105,7 +105,7 @@ describe("DTS scheduler RPC cancellation (mocked transport)", () => {
             const completed = (value: string) =>
                 new OrchestrationState(
                     "instance",
-                    "copilot.workflow.async.v1",
+                    "copilot.workflow.async.v2",
                     OrchestrationStatus.COMPLETED,
                     new Date(0),
                     new Date(0),
@@ -198,7 +198,7 @@ describe("DTS scheduler RPC cancellation (mocked transport)", () => {
                 controller.abort(reason);
                 return new OrchestrationState(
                     "instance",
-                    "copilot.workflow.async.v1",
+                    "copilot.workflow.async.v2",
                     OrchestrationStatus.COMPLETED,
                     new Date(0),
                     new Date(0),
@@ -246,6 +246,202 @@ describe("DTS scheduler RPC cancellation (mocked transport)", () => {
 });
 
 describe("DTS provider with the SDK in-memory test backend (not restart proof)", () => {
+    it("fans out branch effects, shares identical agents/step keys and flushes final progress", async () => {
+        const events: string[] = [];
+        const agent = vi.fn(async (_input, prompt: string) => {
+            events.push(prompt);
+            return prompt;
+        });
+        const step = vi.fn(async (_input, _key, producer) => {
+            events.push("report");
+            return producer();
+        });
+        const progress = vi.fn(async (_input, event) => {
+            events.push(event.text);
+        });
+        const flow = workflow(async (ctx) => {
+            ctx.phase("Review");
+            const values = await ctx.parallel(
+                ["left", "right", "left"].map((side) => async () => {
+                    const value = json(await ctx.agent(side, { label: side }));
+                    return await ctx.step(`branch-${side}`, () => ({ value }));
+                })
+            );
+            ctx.phase("Verify");
+            const report = await ctx.step("report", () => ({ values }));
+            ctx.log(`Completed workflow run ${ctx.runId}`);
+            return report;
+        });
+        const context = setup(flow, { agent, step, progress });
+        await context.worker.start();
+        try {
+            expect(await context.executor.run(flow, invocation)).toEqual({
+                result: { values: [{ value: "left" }, { value: "right" }, { value: "left" }] },
+            });
+            expect(agent).toHaveBeenCalledTimes(2);
+            expect(step).toHaveBeenCalledTimes(3);
+            expect(
+                progress.mock.calls.map(([, event]) => [event.sequence, event.kind, event.text])
+            ).toEqual([
+                [0, "phase", "Review"],
+                [1, "phase", "Verify"],
+                [2, "log", "Completed workflow run run"],
+            ]);
+            expect(progress.mock.calls.map(([, event]) => event.eventId)).toEqual(
+                [0, 1, 2].map(
+                    (sequence) =>
+                        `${context.executor.getInstanceId(invocation)}:progress:${sequence}`
+                )
+            );
+            expect(events[0]).toBe("Review");
+            expect(events[events.length - 1]).toBe("Completed workflow run run");
+            expect(events.indexOf("Verify")).toBeGreaterThan(events.indexOf("right"));
+            expect(await context.executor.run(flow, invocation)).toEqual({
+                result: { values: [{ value: "left" }, { value: "right" }, { value: "left" }] },
+            });
+            expect(progress).toHaveBeenCalledTimes(3);
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
+    it("supports empty parallel and preserves false, zero, empty text, and ordinary-null failures", async () => {
+        const flow = workflow(async (ctx) => ({
+            empty: await ctx.parallel([]),
+            values: await ctx.parallel<JsonValue>([
+                () => false,
+                () => 0,
+                () => "",
+                () => {
+                    throw new Error("ordinary");
+                },
+            ]),
+        }));
+        const host: WorkflowExecutionHost = {
+            agent: vi.fn(async () => null),
+            step: vi.fn(async (_input, _key, producer) => producer()),
+        };
+        const context = setup(flow, host);
+        await context.worker.start();
+        try {
+            expect(await context.executor.run(flow, invocation)).toEqual({
+                result: { empty: [], values: [false, 0, "", null] },
+            });
+            expect(host.agent).not.toHaveBeenCalled();
+            expect(host.step).not.toHaveBeenCalled();
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
+    it.each(["ResponseError", "AbortError"] as const)(
+        "drains admitted branch work and propagates %s without flattening it to null",
+        async (kind) => {
+            const completed: string[] = [];
+            const host: WorkflowExecutionHost = {
+                agent: async (_input, prompt) => {
+                    completed.push(prompt);
+                    if (prompt === "fails") {
+                        if (kind === "AbortError")
+                            throw new DOMException("cancelled", "AbortError");
+                        throw new ResponseError(-32603, "storage unavailable", { code: "storage" });
+                    }
+                    return "other completed";
+                },
+                step: async (_input, _key, producer) => producer(),
+            };
+            const flow = workflow(async (ctx) => {
+                try {
+                    return await ctx.parallel(
+                        ["fails", "other"].map(
+                            (prompt) => async () => json(await ctx.agent(prompt))
+                        )
+                    );
+                } catch (error) {
+                    if (!(error instanceof Error)) throw error;
+                    return {
+                        failureName: error instanceof ResponseError ? "ResponseError" : error.name,
+                    };
+                }
+            });
+            const context = setup(flow, host);
+            await context.worker.start();
+            try {
+                expect(await context.executor.run(flow, invocation)).toEqual({
+                    result: { failureName: kind },
+                });
+                expect(completed).toEqual(["fails", "other"]);
+            } finally {
+                await context.worker.stop();
+            }
+        }
+    );
+
+    it("fails explicitly for missing or failed progress sinks", async () => {
+        const flow = workflow(async (ctx) => {
+            ctx.log("visible");
+            return "must not silently complete";
+        });
+        for (const progress of [
+            undefined,
+            async () => {
+                throw new Error("sink failed");
+            },
+        ]) {
+            const context = setup(flow, {
+                agent: async () => null,
+                step: async (_input, _key, producer) => producer(),
+                ...(progress ? { progress } : {}),
+            });
+            await context.worker.start();
+            try {
+                await expect(context.executor.run(flow, invocation)).rejects.toThrow(
+                    progress ? "sink failed" : "require an executionHost.progress"
+                );
+            } finally {
+                await context.worker.stop();
+            }
+        }
+    });
+
+    it("cannot swallow a parallel producer's profile violation in the outer workflow catch", async () => {
+        const completed: string[] = [];
+        const flow = workflow(async (ctx) => {
+            try {
+                return await ctx.parallel([
+                    async () =>
+                        ctx.step("invalid", async () => {
+                            try {
+                                await ctx.agent("nested effect");
+                            } catch {
+                                return "swallowed";
+                            }
+                            return null;
+                        }),
+                    async () => json(await ctx.agent("other")),
+                ]);
+            } catch {
+                return "must not complete";
+            }
+        });
+        const context = setup(flow, {
+            agent: async (_input, prompt) => {
+                completed.push(prompt);
+                return prompt;
+            },
+            step: async (_input, _key, producer) => producer(),
+        });
+        await context.worker.start();
+        try {
+            await expect(context.executor.run(flow, invocation)).rejects.toThrow(
+                "SDK workflow effects are not allowed"
+            );
+            expect(completed).toEqual(["other"]);
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
     it("schedules separate effects and preserves agent and key-only step memoization", async () => {
         const agent = vi.fn(async (_input, prompt: string) => (prompt === "empty" ? null : 42));
         const step = vi.fn(async (_input, _key, producer) => producer());

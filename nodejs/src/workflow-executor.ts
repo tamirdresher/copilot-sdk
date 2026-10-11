@@ -54,6 +54,18 @@ export interface WorkflowActivityInvocation extends WorkflowInvocation {
 }
 
 /**
+ * Replay-stable progress metadata. Sinks must deduplicate redelivery by eventId.
+ *
+ * @experimental
+ */
+export interface WorkflowProgressEvent {
+    eventId: string;
+    sequence: number;
+    kind: "phase" | "log";
+    text: string;
+}
+
+/**
  * Executes effects, independently of the provider that stores orchestration history.
  *
  * Functions, sessions, credentials, and current execution tokens stay on this
@@ -73,6 +85,8 @@ export interface WorkflowExecutionHost {
         key: string,
         producer: () => Promise<JsonValue> | JsonValue
     ): Promise<JsonValue>;
+    /** Required when the workflow emits phases or logs; never a silent no-op. */
+    progress?(invocation: WorkflowInvocation, event: WorkflowProgressEvent): Promise<void>;
 }
 
 /**
