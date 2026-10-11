@@ -4,11 +4,14 @@
 
 import {
     InMemoryOrchestrationBackend,
+    OrchestrationState,
+    OrchestrationStatus,
     TestOrchestrationClient,
     TestOrchestrationWorker,
     type StartOrchestrationOptions,
     type TaskHubGrpcClient,
 } from "@microsoft/durabletask-js";
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { ResponseError } from "vscode-jsonrpc/node.js";
 import { DtsWorkflowExecutor, type WorkflowExecutionHost } from "../src/workflow-dts.js";
@@ -70,6 +73,177 @@ function workflow(run: WorkflowDefinition["run"]): WorkflowHandle {
         run,
     });
 }
+
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((accept, decline) => {
+        resolve = accept;
+        reject = decline;
+    });
+    return { promise, resolve, reject };
+}
+
+describe("DTS scheduler RPC cancellation (mocked transport)", () => {
+    it.each(
+        (["lookup", "schedule", "poll"] as const).flatMap((stage) =>
+            (["resolve", "reject"] as const).map((lateOutcome) => ({ stage, lateOutcome }))
+        )
+    )(
+        "releases a stalled $stage binding and ignores its late $lateOutcome",
+        async ({ stage, lateOutcome }) => {
+            const lookup = deferred<OrchestrationState | undefined>();
+            const schedule = deferred<string>();
+            const flow = workflow(async () => "pure");
+            const host: WorkflowExecutionHost = {
+                agent: async () => null,
+                step: async (_input, _key, producer) => producer(),
+            };
+            let input: unknown;
+            let lookupCalls = 0;
+            let scheduleCalls = 0;
+            const completed = (value: string) =>
+                new OrchestrationState(
+                    "instance",
+                    "copilot.workflow.async.v1",
+                    OrchestrationStatus.COMPLETED,
+                    new Date(0),
+                    new Date(0),
+                    JSON.stringify(input),
+                    JSON.stringify({ result: value })
+                );
+            const getOrchestrationState = vi.fn<TaskHubGrpcClient["getOrchestrationState"]>(
+                async () => {
+                    lookupCalls++;
+                    if (
+                        (stage === "lookup" && lookupCalls === 1) ||
+                        (stage === "poll" && lookupCalls === 2)
+                    )
+                        return lookup.promise;
+                    return lookupCalls === 1 ? undefined : completed("fresh");
+                }
+            );
+            const scheduleNewOrchestration = vi.fn(
+                async (
+                    _name: unknown,
+                    value?: unknown,
+                    _options?: string | StartOrchestrationOptions,
+                    _startAt?: Date
+                ) => {
+                    input = value;
+                    scheduleCalls++;
+                    return stage === "schedule" && scheduleCalls === 1
+                        ? schedule.promise
+                        : "instance";
+                }
+            );
+            const executor = new DtsWorkflowExecutor({
+                client: { getOrchestrationState, scheduleNewOrchestration },
+                worker: new TestOrchestrationWorker(new InMemoryOrchestrationBackend()),
+                workflows: [flow],
+                codeVersion: "cancellation-test",
+                executionHost: host,
+            });
+            const controller = new AbortController();
+            const waiting = executor.run(flow, invocation, controller.signal);
+            let settled: "pending" | "fulfilled" | "rejected" = "pending";
+            void waiting.then(
+                () => {
+                    settled = "fulfilled";
+                },
+                () => {
+                    settled = "rejected";
+                }
+            );
+            await vi.waitFor(() => {
+                expect(stage === "schedule" ? scheduleCalls : lookupCalls).toBe(
+                    stage === "poll" ? 2 : 1
+                );
+            });
+            const reason = new Error("cancelled by caller");
+            controller.abort(reason);
+            await vi.waitFor(() => expect(settled).toBe("rejected"), { timeout: 500 });
+            await expect(waiting).rejects.toBe(reason);
+
+            const replacementLookup = deferred<OrchestrationState | undefined>();
+            getOrchestrationState.mockImplementationOnce(() => replacementLookup.promise);
+            const previousCalls = getOrchestrationState.mock.calls.length;
+            const replacement = executor.run(flow, invocation);
+            await vi.waitFor(() =>
+                expect(getOrchestrationState.mock.calls.length).toBe(previousCalls + 1)
+            );
+            if (stage === "schedule") {
+                if (lateOutcome === "resolve") schedule.resolve("late-acknowledgement");
+                else schedule.reject(new Error("late scheduler failure"));
+            } else {
+                if (lateOutcome === "resolve") lookup.resolve(completed("late completion"));
+                else lookup.reject(new Error("late scheduler failure"));
+            }
+            await setImmediate();
+            expect(settled).toBe("rejected");
+            await expect(executor.run(flow, invocation)).rejects.toThrow("already bound");
+            replacementLookup.resolve(undefined);
+            await expect(replacement).resolves.toEqual({ result: "fresh" });
+            expect(scheduleCalls).toBe(stage === "lookup" ? 1 : 2);
+        }
+    );
+
+    it("rejects completion when cancellation arrives with the scheduler reply", async () => {
+        const controller = new AbortController();
+        const reason = new Error("abort at completion");
+        const getOrchestrationState = vi
+            .fn<TaskHubGrpcClient["getOrchestrationState"]>()
+            .mockResolvedValueOnce(undefined)
+            .mockImplementationOnce(async () => {
+                controller.abort(reason);
+                return new OrchestrationState(
+                    "instance",
+                    "copilot.workflow.async.v1",
+                    OrchestrationStatus.COMPLETED,
+                    new Date(0),
+                    new Date(0),
+                    undefined,
+                    JSON.stringify({ result: "too late" })
+                );
+            });
+        const flow = workflow(async () => null);
+        const executor = new DtsWorkflowExecutor({
+            client: {
+                getOrchestrationState,
+                scheduleNewOrchestration: vi.fn(async () => "instance"),
+            },
+            worker: new TestOrchestrationWorker(new InMemoryOrchestrationBackend()),
+            workflows: [flow],
+            codeVersion: "completion-test",
+            executionHost: {
+                agent: async () => null,
+                step: async (_input, _key, producer) => producer(),
+            },
+        });
+        await expect(executor.run(flow, invocation, controller.signal)).rejects.toBe(reason);
+    });
+
+    it("does not dispatch a scheduler call for an already cancelled waiter", async () => {
+        const getOrchestrationState = vi.fn<TaskHubGrpcClient["getOrchestrationState"]>();
+        const scheduleNewOrchestration = vi.fn(async () => "instance");
+        const flow = workflow(async () => null);
+        const executor = new DtsWorkflowExecutor({
+            client: { getOrchestrationState, scheduleNewOrchestration },
+            worker: new TestOrchestrationWorker(new InMemoryOrchestrationBackend()),
+            workflows: [flow],
+            codeVersion: "pre-abort-test",
+            executionHost: {
+                agent: async () => null,
+                step: async (_input, _key, producer) => producer(),
+            },
+        });
+        await expect(executor.run(flow, invocation, AbortSignal.abort())).rejects.toMatchObject({
+            name: "AbortError",
+        });
+        expect(getOrchestrationState).not.toHaveBeenCalled();
+        expect(scheduleNewOrchestration).not.toHaveBeenCalled();
+    });
+});
 
 describe("DTS provider with the SDK in-memory test backend (not restart proof)", () => {
     it("schedules separate effects and preserves agent and key-only step memoization", async () => {

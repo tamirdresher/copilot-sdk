@@ -9,6 +9,7 @@ export const MINIMUM_DEPENDENCY_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export interface ProductionDependencyManifest {
     dependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
 }
 
 export interface ProductionDependency {
@@ -35,7 +36,7 @@ function dependencyKey(dependency: ProductionDependency): string {
 
 function readDependencySection(
     manifest: Record<string, unknown>,
-    section: "dependencies" | "optionalDependencies"
+    section: "dependencies" | "optionalDependencies" | "peerDependencies"
 ): Record<string, string> | undefined {
     const value = manifest[section];
     if (value === undefined) {
@@ -56,6 +57,7 @@ export function readProductionDependencyManifest(path: string): ProductionDepend
     return {
         dependencies: readDependencySection(parsed, "dependencies"),
         optionalDependencies: readDependencySection(parsed, "optionalDependencies"),
+        peerDependencies: readDependencySection(parsed, "peerDependencies"),
     };
 }
 
@@ -63,7 +65,7 @@ export function assertExactProductionDependencies(
     manifest: ProductionDependencyManifest
 ): ProductionDependency[] {
     const dependencies: ProductionDependency[] = [];
-    for (const section of ["dependencies", "optionalDependencies"] as const) {
+    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"] as const) {
         for (const [name, version] of Object.entries(manifest[section] ?? {})) {
             assert.equal(
                 semver.valid(version),

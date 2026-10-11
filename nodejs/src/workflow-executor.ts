@@ -4,6 +4,34 @@
 
 import type { JsonValue, WorkflowAgentOptions, WorkflowDefinition } from "./workflow.js";
 
+/** @internal */
+export async function awaitWorkflowOperation<TResult>(
+    operation: () => Promise<TResult>,
+    signal: AbortSignal
+): Promise<TResult> {
+    let rejectAbort: ((reason?: unknown) => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject;
+    });
+    const onAbort = () => rejectAbort?.(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+        // Register/check before dispatch. The race also consumes late RPC rejections.
+        signal.throwIfAborted();
+        const result = await Promise.race([
+            Promise.resolve().then(() => {
+                signal.throwIfAborted();
+                return operation();
+            }),
+            aborted,
+        ]);
+        signal.throwIfAborted();
+        return result;
+    } finally {
+        signal.removeEventListener("abort", onAbort);
+    }
+}
+
 /**
  * Stable, non-secret identity and input supplied by a workflow's owning host.
  *

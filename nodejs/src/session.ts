@@ -90,7 +90,7 @@ import {
     type JsonValue,
     type WorkflowStepOptions,
 } from "./workflow.js";
-import type { WorkflowExecutor } from "./workflow-executor.js";
+import { awaitWorkflowOperation, type WorkflowExecutor } from "./workflow-executor.js";
 import { assertWorkflowResult, assertWorkflowStepResult } from "./workflow-json.js";
 
 function isWorkflowResumeErrorCode(value: unknown): value is WorkflowResumeErrorCode {
@@ -348,30 +348,6 @@ class WorkflowProgressBuffer {
             clearTimeout(this.flushTimer);
             this.flushTimer = undefined;
         }
-    }
-}
-
-async function awaitWorkflowOperation<TResult>(
-    operation: () => Promise<TResult>,
-    signal: AbortSignal
-): Promise<TResult> {
-    // The operation is a thunk so an already-aborted run never dispatches the
-    // RPC at all, rather than sending it and rejecting locally afterwards.
-    let rejectAbort: ((reason?: unknown) => void) | undefined;
-    const abortPromise = new Promise<never>((_resolve, reject) => {
-        rejectAbort = reject;
-    });
-    const onAbort = () =>
-        rejectAbort?.(signal.reason ?? new DOMException("Workflow run was aborted", "AbortError"));
-    // Register before the abort check and before dispatching, so an abort can
-    // neither be missed by a not-yet-attached listener nor start work on an
-    // already-cancelled run.
-    signal.addEventListener("abort", onAbort, { once: true });
-    try {
-        throwIfWorkflowAborted(signal);
-        return await Promise.race([operation(), abortPromise]);
-    } finally {
-        signal.removeEventListener("abort", onAbort);
     }
 }
 

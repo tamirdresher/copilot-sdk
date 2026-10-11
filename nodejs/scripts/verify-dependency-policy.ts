@@ -16,13 +16,21 @@ async function main(): Promise<void> {
     const resolvedDependencies = readResolvedProductionDependencies(
         join(nodeRoot, "package-lock.json")
     );
-    const publicationTimes = await loadNpmPublicationTimes(resolvedDependencies);
-    assertMinimumPublicationAge(resolvedDependencies, publicationTimes);
-    const externalCount = resolvedDependencies.filter((dependency) =>
+    const publicationDependencies = [
+        ...new Map(
+            [...directDependencies, ...resolvedDependencies].map((dependency) => [
+                `${dependency.name}@${dependency.version}`,
+                dependency,
+            ])
+        ).values(),
+    ];
+    const publicationTimes = await loadNpmPublicationTimes(publicationDependencies);
+    assertMinimumPublicationAge(publicationDependencies, publicationTimes);
+    const externalCount = publicationDependencies.filter((dependency) =>
         requiresPublicationCooldown(dependency.name)
     ).length;
     console.log(
-        `Verified ${directDependencies.length} exact direct production dependencies; ${externalCount} resolved production package versions meet the seven-day npm publication age requirement.`
+        `Verified ${directDependencies.length} exact direct production/peer dependencies; ${externalCount} production/peer package versions meet the seven-day npm publication age requirement.`
     );
 }
 

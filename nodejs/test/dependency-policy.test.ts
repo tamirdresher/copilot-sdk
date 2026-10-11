@@ -40,6 +40,19 @@ describe("production dependency policy", () => {
         }
     );
 
+    it("keeps optional provider peers under the exact-version policy", () => {
+        expect(
+            assertExactProductionDependencies({
+                peerDependencies: { "@microsoft/durabletask-js": "0.4.0" },
+            })
+        ).toEqual([{ name: "@microsoft/durabletask-js", version: "0.4.0" }]);
+        expect(() =>
+            assertExactProductionDependencies({
+                peerDependencies: { "@microsoft/durabletask-js": "^0.4.0" },
+            })
+        ).toThrow("peerDependencies.@microsoft/durabletask-js must use an exact SemVer version");
+    });
+
     it("accepts a version at the exact seven-day boundary", () => {
         const now = Date.parse(publishedAt) + MINIMUM_DEPENDENCY_AGE_MS;
         expect(() =>

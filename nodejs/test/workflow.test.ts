@@ -199,6 +199,43 @@ describe("dynamic workflows", () => {
         expect(step).toHaveBeenCalledTimes(2);
     });
 
+    it("cancels a Local workflow while its agent RPC is pending", async () => {
+        let finish!: (value: { result: string }) => void;
+        const reply = new Promise<{ result: string }>((resolve) => {
+            finish = resolve;
+        });
+        const sendRequest = vi.fn(async () => reply);
+        const continued = vi.fn();
+        const workflow = defineWorkflow({
+            meta: { name: "local-abort", description: "Local cancellation", phases: [] },
+            run: async (ctx) => {
+                await ctx.agent("parked");
+                continued();
+                return "completed";
+            },
+        });
+        const session = new CopilotSession("local-abort-session", { sendRequest } as never);
+        session.registerWorkflows([workflow]);
+        const pending = session.clientSessionApis.workflow!.execute({
+            sessionId: session.sessionId,
+            name: "local-abort",
+            runId: "local-abort-run",
+            executionToken: "attempt",
+            args: {},
+        });
+        const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+        await vi.waitFor(() => expect(sendRequest).toHaveBeenCalledOnce());
+        await session.clientSessionApis.workflow!.abort({
+            sessionId: session.sessionId,
+            runId: "local-abort-run",
+            executionToken: "attempt",
+        });
+        await rejected;
+        finish({ result: "late" });
+        await Promise.resolve();
+        expect(continued).not.toHaveBeenCalled();
+    });
+
     it("uses workflow-specific validation errors", async () => {
         const workflow = defineWorkflow({
             meta: {

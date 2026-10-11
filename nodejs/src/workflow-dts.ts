@@ -16,11 +16,12 @@ import {
     type WorkflowDefinition,
     type WorkflowHandle,
 } from "./workflow.js";
-import type {
-    WorkflowActivityInvocation,
-    WorkflowExecutionHost,
-    WorkflowExecutor,
-    WorkflowInvocation,
+import {
+    awaitWorkflowOperation,
+    type WorkflowActivityInvocation,
+    type WorkflowExecutionHost,
+    type WorkflowExecutor,
+    type WorkflowInvocation,
 } from "./workflow-executor.js";
 import { assertWorkflowResult, assertWorkflowStepResult } from "./workflow-json.js";
 import {
@@ -263,10 +264,13 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
             runId: invocation.runId,
         });
         if (this.bindings.has(instanceId)) throw new Error("Workflow execution is already bound");
-        this.bindings.set(instanceId, { host, signal });
+        const binding = { host, signal };
+        this.bindings.set(instanceId, binding);
         try {
-            const existing = await this.options.client.getOrchestrationState(instanceId, true);
-            signal.throwIfAborted();
+            const existing = await awaitWorkflowOperation(
+                () => this.options.client.getOrchestrationState(instanceId, true),
+                signal
+            );
             if (existing) {
                 if (
                     existing.name !== ORCHESTRATOR ||
@@ -280,13 +284,20 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
                     );
                 }
             } else {
-                await this.options.client.scheduleNewOrchestration(ORCHESTRATOR, input, {
-                    instanceId,
-                });
+                await awaitWorkflowOperation(
+                    () =>
+                        this.options.client.scheduleNewOrchestration(ORCHESTRATOR, input, {
+                            instanceId,
+                        }),
+                    signal
+                );
             }
             while (true) {
                 signal.throwIfAborted();
-                const state = await this.options.client.getOrchestrationState(instanceId, true);
+                const state = await awaitWorkflowOperation(
+                    () => this.options.client.getOrchestrationState(instanceId, true),
+                    signal
+                );
                 if (!state) throw new Error("Scheduled workflow instance is missing");
                 state.raiseIfFailed();
                 if (state.runtimeStatus === OrchestrationStatus.TERMINATED) {
@@ -302,12 +313,13 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
                     }
                     const result = "result" in output ? output.result : undefined;
                     assertWorkflowResult(result);
+                    signal.throwIfAborted();
                     return result === undefined ? {} : { result };
                 }
                 await setTimeout(250, undefined, { signal });
             }
         } finally {
-            this.bindings.delete(instanceId);
+            if (this.bindings.get(instanceId) === binding) this.bindings.delete(instanceId);
         }
     }
 

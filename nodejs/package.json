@@ -54,6 +54,7 @@
         "test": "vitest run",
         "test:unit": "vitest run --exclude=\"test/e2e/**\"",
         "test:workflow-dts": "npm run build && vitest run --config vitest.dts.config.ts",
+        "test:workflow-node20": "npm run build && node scripts/check-workflow-node20.mjs",
         "test:watch": "vitest",
         "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" --ignore-path .prettierignore",
         "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" --ignore-path .prettierignore",
@@ -76,13 +77,13 @@
     "author": "GitHub",
     "license": "MIT",
     "dependencies": {
-        "@microsoft/durabletask-js": "0.4.0",
         "koffi": "3.2.1",
         "vscode-jsonrpc": "8.2.1",
         "zod": "4.3.6"
     },
     "devDependencies": {
         "@microsoft/agent-host-protocol-v09": "npm:@microsoft/agent-host-protocol@0.9.0",
+        "@microsoft/durabletask-js": "0.4.0",
         "@platformatic/vfs": "^0.3.0",
         "@types/node": "^25.2.0",
         "@types/semver": "7.8.0",
@@ -104,6 +105,14 @@
         "typescript": "^5.0.0",
         "vitest": "^4.0.18",
         "ws": "^8.21.0"
+    },
+    "peerDependencies": {
+        "@microsoft/durabletask-js": "0.4.0"
+    },
+    "peerDependenciesMeta": {
+        "@microsoft/durabletask-js": {
+            "optional": true
+        }
     },
     "engines": {
         "node": "^20.19.0 || >=22.12.0"

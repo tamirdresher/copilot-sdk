@@ -434,7 +434,12 @@ signal when present, never a signal restored from history.
 
 Stopping a worker leaves scheduler history intact. A cold worker with the same
 artifact and a fresh `executionHost` resumes incomplete activities. Aborting
-`executor.run` stops that caller's wait; it does not terminate DTS. Scheduler
+`executor.run` promptly rejects that caller's wait, including during a pending
+scheduler lookup, admission, or poll, and releases its live binding. Late RPC
+results cannot complete the cancelled waiter or remove a replacement binding.
+An already dispatched admission can still reach the scheduler after cancellation;
+reattach using the same scope/run IDs rather than assuming no run was created.
+Cancellation does not terminate DTS. Scheduler
 termination/suspension, Copilot pause/cancel outcomes, budget enforcement, and
 native session-token rebinding need a runtime/service owner before this binding
 can be shipped through native authoring tools. Unsupported operations do not
@@ -442,13 +447,33 @@ fall back to the local journal.
 
 ### Developer restart proof
 
-The provider requires Node.js 22 or later; the local SDK's prerequisites are
-unchanged. The explicit DTS test profile requires a responsive Docker engine
+The provider requires Node.js 22 or later and the optional peer
+`@microsoft/durabletask-js@0.4.0`. Local-only installations do not install this
+peer and retain the SDK's Node.js 20.19 minimum, including engine-strict installs.
+The host opting into DTS installs the peer, not a workflow author:
+
+```powershell
+npm install @microsoft/durabletask-js@0.4.0 --registry=https://packagefeedproxy.microsoft.io/npm/
+```
+
+SDK development installs the pinned DTS package as a development dependency.
+The explicit DTS test profile requires a responsive Docker engine
 and the Microsoft DTS emulator. From the SDK root on Windows:
 
 ```powershell
 npm --prefix .\nodejs ci --ignore-scripts --registry=https://packagefeedproxy.microsoft.io/npm/
 npm --prefix .\nodejs run test:workflow-dts
+```
+
+The separate minimum-runtime regression builds/packs the SDK, installs that
+archive with `--engine-strict` using Node.js 20.19.0 in an isolated consumer,
+and exercises the default Local workflow and ESM/CommonJS exports without DTS.
+It then explicitly installs the optional peer with the development host's
+Node.js 22+ runtime and checks the packed DTS provider's ESM/CommonJS exports.
+Supply an existing Node.js 20.19.0 binary; this check does not install runtimes:
+
+```powershell
+npm --prefix .\nodejs run test:workflow-node20 -- "C:\toolchains\node20\node.exe"
 ```
 
 The test creates one uniquely named emulator container with loopback-only
