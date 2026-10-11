@@ -105,7 +105,7 @@ describe("DTS scheduler RPC cancellation (mocked transport)", () => {
             const completed = (value: string) =>
                 new OrchestrationState(
                     "instance",
-                    "copilot.workflow.async.v2",
+                    "copilot.workflow.async.v3",
                     OrchestrationStatus.COMPLETED,
                     new Date(0),
                     new Date(0),
@@ -198,7 +198,7 @@ describe("DTS scheduler RPC cancellation (mocked transport)", () => {
                 controller.abort(reason);
                 return new OrchestrationState(
                     "instance",
-                    "copilot.workflow.async.v2",
+                    "copilot.workflow.async.v3",
                     OrchestrationStatus.COMPLETED,
                     new Date(0),
                     new Date(0),
@@ -243,9 +243,209 @@ describe("DTS scheduler RPC cancellation (mocked transport)", () => {
         expect(getOrchestrationState).not.toHaveBeenCalled();
         expect(scheduleNewOrchestration).not.toHaveBeenCalled();
     });
+
+    it("rejects a stored v2 instance instead of attaching with v3 replay semantics", async () => {
+        const getOrchestrationState = vi
+            .fn<TaskHubGrpcClient["getOrchestrationState"]>()
+            .mockResolvedValue(
+                new OrchestrationState(
+                    "instance",
+                    "copilot.workflow.async.v2",
+                    OrchestrationStatus.COMPLETED,
+                    new Date(0),
+                    new Date(0),
+                    "{}",
+                    JSON.stringify({ result: "old result" })
+                )
+            );
+        const scheduleNewOrchestration = vi.fn(async () => "instance");
+        const flow = workflow(async () => null);
+        const executor = new DtsWorkflowExecutor({
+            client: { getOrchestrationState, scheduleNewOrchestration },
+            worker: new TestOrchestrationWorker(new InMemoryOrchestrationBackend()),
+            workflows: [flow],
+            codeVersion: "protocol-pin-test",
+            executionHost: {
+                agent: async () => null,
+                step: async (_input, _key, producer) => producer(),
+            },
+        });
+        await expect(executor.run(flow, invocation)).rejects.toMatchObject({
+            code: "workflow_replay_diverged",
+        });
+        expect(scheduleNewOrchestration).not.toHaveBeenCalled();
+    });
 });
 
 describe("DTS provider with the SDK in-memory test backend (not restart proof)", () => {
+    it("replays a parallel RPC rejection into its branch catch and executes the fallback once", async () => {
+        const agent = vi.fn(async (_input, prompt: string) => {
+            if (prompt === "left")
+                throw new ResponseError(-32603, "left failed", { code: "storage" });
+            return "ok";
+        });
+        const step = vi.fn(async (_input, _key, producer) => producer());
+        const flow = workflow(async (ctx) =>
+            ctx.parallel([
+                async () => {
+                    try {
+                        return json(await ctx.agent("left"));
+                    } catch (error) {
+                        if (!(error instanceof ResponseError)) throw error;
+                        return await ctx.step("fallback", () => ({ recovered: error.code }));
+                    }
+                },
+                async () => json(await ctx.agent("right")),
+            ])
+        );
+        const context = setup(flow, { agent, step });
+        await context.worker.start();
+        try {
+            await expect(context.executor.run(flow, invocation)).resolves.toEqual({
+                result: [{ recovered: -32603 }, "ok"],
+            });
+            expect(agent.mock.calls.map(([, prompt]) => prompt)).toEqual(["left", "right"]);
+            expect(step).toHaveBeenCalledOnce();
+            expect(step.mock.calls[0][1]).toBe("fallback");
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
+    it("replays captures across successive completed parallel groups without repeating effects", async () => {
+        const agent = vi.fn(async (_input, prompt: string) => (prompt === "left" ? 7 : 9));
+        const step = vi.fn(async (_input, _key, producer) => producer());
+        const flow = workflow(async (ctx) => {
+            const values: Record<string, JsonValue> = {};
+            await ctx.parallel(
+                ["left", "right"].map((side) => async () => {
+                    values[side] = json(await ctx.agent(side, { label: side }));
+                    return null;
+                })
+            );
+            await ctx.parallel(
+                ["left", "right"].map((side) => async () => {
+                    const previous = values[side];
+                    const repeated = json(await ctx.agent(side, { label: side }));
+                    values[side] = { previous, repeated };
+                    return null;
+                })
+            );
+            return await ctx.step("report", () => ({ values }));
+        });
+        const context = setup(flow, { agent, step });
+        await context.worker.start();
+        try {
+            await expect(context.executor.run(flow, invocation)).resolves.toEqual({
+                result: {
+                    values: {
+                        left: { previous: 7, repeated: 7 },
+                        right: { previous: 9, repeated: 9 },
+                    },
+                },
+            });
+            expect(agent).toHaveBeenCalledTimes(2);
+            expect(step).toHaveBeenCalledOnce();
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
+    it("propagates an uncaught parallel RPC failure only after admitted branch work completes", async () => {
+        const completed: string[] = [];
+        const flow = workflow(async (ctx) =>
+            ctx.parallel(
+                ["left", "right"].map((prompt) => async () => json(await ctx.agent(prompt)))
+            )
+        );
+        const context = setup(flow, {
+            agent: async (_input, prompt) => {
+                completed.push(prompt);
+                if (prompt === "left") throw new ResponseError(-32603, "uncaught branch failure");
+                return "ok";
+            },
+            step: async (_input, _key, producer) => producer(),
+        });
+        await context.worker.start();
+        try {
+            await expect(context.executor.run(flow, invocation)).rejects.toThrow(
+                "uncaught branch failure"
+            );
+            expect(completed).toEqual(["left", "right"]);
+            const state = await context.client.getOrchestrationState(
+                context.executor.getInstanceId(invocation),
+                true
+            );
+            expect(state?.runtimeStatus).toBe(OrchestrationStatus.FAILED);
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
+    it("rebuilds parallel branch captures before reconstructing the report producer", async () => {
+        const agent = vi.fn(async (_input, prompt: string) => (prompt === "left" ? 7 : 9));
+        const step = vi.fn(async (_input, _key, producer) => producer());
+        const flow = workflow(async (ctx) => {
+            const values: Record<string, JsonValue> = {};
+            await ctx.parallel(
+                ["left", "right"].map((side) => async () => {
+                    values[side] = json(await ctx.agent(side, { label: side }));
+                    return null;
+                })
+            );
+            return await ctx.step("report", () => ({ values }));
+        });
+        const context = setup(flow, { agent, step });
+        await context.worker.start();
+        try {
+            await expect(context.executor.run(flow, invocation)).resolves.toEqual({
+                result: { values: { left: 7, right: 9 } },
+            });
+            expect(agent.mock.calls.map(([, prompt]) => prompt)).toEqual(["left", "right"]);
+            expect(step).toHaveBeenCalledOnce();
+            expect(step.mock.calls[0][1]).toBe("report");
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
+    it("delivers phase and log metadata before propagating an unhandled root failure", async () => {
+        const progress = vi.fn(async (_input, _event) => {});
+        const flow = workflow(async (ctx) => {
+            ctx.phase("Review");
+            await ctx.agent("review");
+            ctx.phase("Verify");
+            ctx.log("Validation failed");
+            throw new Error("validation failed");
+        });
+        const context = setup(flow, {
+            agent: async () => "reviewed",
+            step: async (_input, _key, producer) => producer(),
+            progress,
+        });
+        await context.worker.start();
+        try {
+            await expect(context.executor.run(flow, invocation)).rejects.toThrow(
+                "validation failed"
+            );
+            expect(
+                progress.mock.calls.map(([, event]) => [event.sequence, event.kind, event.text])
+            ).toEqual([
+                [0, "phase", "Review"],
+                [1, "phase", "Verify"],
+                [2, "log", "Validation failed"],
+            ]);
+            const state = await context.client.getOrchestrationState(
+                context.executor.getInstanceId(invocation),
+                true
+            );
+            expect(state?.runtimeStatus).toBe(OrchestrationStatus.FAILED);
+            expect(state?.serializedOutput).toBeUndefined();
+        } finally {
+            await context.worker.stop();
+        }
+    });
+
     it("fans out branch effects, shares identical agents/step keys and flushes final progress", async () => {
         const events: string[] = [];
         const agent = vi.fn(async (_input, prompt: string) => {

@@ -408,7 +408,12 @@ DTS schedules all distinct frontier activities before awaiting any completion;
 it does not execute the thunks serially inside a long activity. The orchestrator
 records actual completion order and per-branch histories while preserving input
 array order in the returned results. Replaying branch promises uses that
-recorded completion order. A branch can contain sequential agent/step calls;
+recorded completion order. A recorded rejection enters its originating branch's
+`catch` before the adapter decides whether it remains an unhandled failure.
+Completed parallel groups replay their branch continuations before returning the
+aggregate to the root, so pure workflow-local captures are rebuilt for later
+step producers; this replay never reschedules their recorded effects.
+A branch can contain sequential agent/step calls;
 this profile drains a frontier round before discovering the next round, so it
 does not implement the barrier-free `pipeline` helper. Duplicate agent calls or
 step keys share one scheduled effect, including within a parallel round.
@@ -417,6 +422,8 @@ step keys share one scheduled effect, including within a parallel round.
 their ordered metadata without emitting it during replay. Separate **Progress**
 activities deliver new records before the next effects, and deliver the final
 log before the run completes. Root progress is replay-validated and durable;
+an unhandled root failure also carries its collected progress back to the
+orchestrator, which delivers new phase/log records before failing the run.
 progress from competing branches or inside step producers remains unsupported.
 
 ExecuteStep replays the same prefix to recreate the producer at its operation
@@ -454,8 +461,8 @@ fail explicitly. Concurrent/unawaited SDK calls and competing SDK calls through
 raw `Promise.all`/`Promise.race` are rejected; arbitrary JavaScript race semantics
 are not implemented. Profile violations cannot be made valid by catching them.
 Declared resource limits reject registration until native accounting is wired.
-The v2 driver/activity protocol pins these history semantics. It does not
-replay an existing v1 instance as v2: an incompatible instance/artifact rejects.
+The v3 driver/activity protocol pins these history semantics. It does not
+replay an existing v1/v2 instance as v3: an incompatible instance/artifact rejects.
 
 The body outside producers must be pure and deterministic. Put I/O in a step
 producer or the execution host. Replay diagnoses new async resources and waits
@@ -537,6 +544,9 @@ finishes first; a cold worker then resumes the other branch without rerunning
 the recorded one. The test asserts completion order, input-order results,
 report-producer reconstruction, both phase records, and the final log.
 The gates are test-only execution-host behavior, not a change to author code.
+An additional capture scenario verifies that recorded parallel continuations
+rebuild workflow-local values before a post-restart report producer executes,
+without repeating the recorded agent activity.
 For this published example, the **Verify** phase contains a report step;
 it is not an additional AI verification call.
 

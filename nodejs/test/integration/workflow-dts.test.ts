@@ -52,7 +52,9 @@ async function killOwned(child: ChildProcess): Promise<void> {
     await waitFor(() => child.exitCode !== null || child.signalCode !== null, "worker exit");
 }
 
-async function proveRestart(scenario: "sequential" | "published-parallel"): Promise<void> {
+async function proveRestart(
+    scenario: "sequential" | "published-parallel" | "parallel-captures"
+): Promise<void> {
     const artifactRoot = resolve(process.env.COPILOT_DTS_TEST_ARTIFACT_DIR ?? nodeRoot);
     await mkdir(artifactRoot, { recursive: true });
     const directory = await mkdtemp(join(artifactRoot, ".dts-restart-"));
@@ -71,6 +73,7 @@ async function proveRestart(scenario: "sequential" | "published-parallel"): Prom
                 directory,
                 runId,
                 mode,
+                scenario,
             ],
             {
                 cwd: nodeRoot,
@@ -165,10 +168,10 @@ async function proveRestart(scenario: "sequential" | "published-parallel"): Prom
         const agents = before.filter(
             (event) =>
                 event.type === HistoryEventType.TaskScheduled &&
-                event.name === "copilot.workflow.agent.v2"
+                event.name === "copilot.workflow.agent.v3"
         );
         expect(agents).toHaveLength(2);
-        if (scenario === "published-parallel") {
+        if (scenario !== "sequential") {
             expect(
                 before.filter(
                     (event) =>
@@ -220,12 +223,19 @@ async function proveRestart(scenario: "sequential" | "published-parallel"): Prom
                       first: { value: 7 },
                       second: { verified: true, input: { first: { value: 7 } } },
                   }
-                : {
-                      reviews: [
-                          { file: "slow.js", review: "slow reviewed" },
-                          { file: "fast.js", review: "fast reviewed" },
-                      ],
-                  };
+                : scenario === "parallel-captures"
+                  ? {
+                        values: {
+                            "slow.js": { file: "slow.js", review: "slow reviewed" },
+                            "fast.js": { file: "fast.js", review: "fast reviewed" },
+                        },
+                    }
+                  : {
+                        reviews: [
+                            { file: "slow.js", review: "slow reviewed" },
+                            { file: "fast.js", review: "fast reviewed" },
+                        ],
+                    };
         expect(completed).toEqual({
             instanceId,
             result: expected,
@@ -267,7 +277,7 @@ async function proveRestart(scenario: "sequential" | "published-parallel"): Prom
         expect(recovered).toEqual(parked);
         const finalHistory = await scheduler.getOrchestrationHistory(instanceId);
         let progress: unknown;
-        if (scenario === "published-parallel") {
+        if (scenario !== "sequential") {
             const fastCompletion = finalHistory.findIndex(
                 (event) =>
                     event.type === HistoryEventType.TaskCompleted &&
@@ -328,7 +338,7 @@ async function proveRestart(scenario: "sequential" | "published-parallel"): Prom
     }
 }
 
-it.each(["sequential", "published-parallel"] as const)(
+it.each(["sequential", "published-parallel", "parallel-captures"] as const)(
     "recovers the same %s scheduler instance in an independent cold worker",
     proveRestart
 );

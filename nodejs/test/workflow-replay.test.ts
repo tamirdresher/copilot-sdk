@@ -291,6 +291,128 @@ describe("sequential async workflow replay (no scheduler)", () => {
         });
     });
 
+    it("replays completed branch continuations in recorded order before capturing a root producer", async () => {
+        const produced = vi.fn();
+        const workflow = definition(async (ctx) => {
+            const values: Record<string, JsonValue> = {};
+            const order: string[] = [];
+            await ctx.parallel(
+                ["left", "right"].map((side) => async () => {
+                    values[side] = json(await ctx.agent(side));
+                    order.push(side);
+                    return null;
+                })
+            );
+            return await ctx.step("report", () => {
+                produced();
+                return { values, order };
+            });
+        });
+        const initial = await replayWorkflow(workflow, invocation, []);
+        if (initial.turn.status !== "parallel") throw new Error("Missing parallel frontier");
+        const parallel: WorkflowParallelHistory = {
+            branches: initial.turn.branches.map((branch, index) => {
+                if (branch.status !== "command") throw new Error("Missing branch command");
+                return [
+                    {
+                        command: branch.command,
+                        outcome: {
+                            status: "fulfilled",
+                            value: index === 0 ? 7 : 9,
+                        },
+                    },
+                ];
+            }),
+            completionOrder: [
+                { branch: 1, index: 0 },
+                { branch: 0, index: 0 },
+            ],
+        };
+        const captured = await replayWorkflow(workflow, invocation, [
+            {
+                command: initial.turn.command,
+                outcome: { status: "fulfilled", value: [null, null] },
+                parallel,
+            },
+        ]);
+        expect(captured.turn).toMatchObject({
+            status: "command",
+            command: { index: 1, kind: "step" },
+        });
+        expect(produced).not.toHaveBeenCalled();
+        await expect(captured.producer?.()).resolves.toEqual({
+            values: { left: 7, right: 9 },
+            order: ["right", "left"],
+        });
+        expect(produced).toHaveBeenCalledOnce();
+    });
+
+    it("detects changed completed parallel outcomes even if the workflow catches rejections", async () => {
+        const workflow = definition(async (ctx) => {
+            try {
+                return await ctx.parallel([async () => json(await ctx.agent("one"))]);
+            } catch {
+                return "swallowed";
+            }
+        });
+        const initial = await replayWorkflow(workflow, invocation, []);
+        if (initial.turn.status !== "parallel" || initial.turn.branches[0].status !== "command") {
+            throw new Error("Missing parallel frontier");
+        }
+        const parallel: WorkflowParallelHistory = {
+            branches: [
+                [
+                    {
+                        command: initial.turn.branches[0].command,
+                        outcome: { status: "fulfilled", value: 7 },
+                    },
+                ],
+            ],
+            completionOrder: [{ branch: 0, index: 0 }],
+        };
+        await expect(
+            replayWorkflow(workflow, invocation, [
+                {
+                    command: initial.turn.command,
+                    outcome: { status: "fulfilled", value: [99] },
+                    parallel,
+                },
+            ])
+        ).rejects.toMatchObject({ code: "workflow_replay_diverged" });
+    });
+
+    it("returns failure and collected progress together for an unhandled root rejection", async () => {
+        const workflow = definition(async (ctx) => {
+            ctx.phase("Review");
+            await ctx.agent("review");
+            ctx.phase("Verify");
+            ctx.log("Validation failed");
+            throw new ResponseError(-32603, "validation failed", { code: "validation" });
+        });
+        const first = await replayWorkflow(workflow, invocation, []);
+        if (first.turn.status !== "command") throw new Error("Missing command");
+        const next = await replayWorkflow(workflow, invocation, [
+            {
+                command: first.turn.command,
+                outcome: { status: "fulfilled", value: "reviewed" },
+            },
+        ]);
+        expect(next.turn).toMatchObject({
+            status: "failed",
+            error: {
+                kind: "error",
+                message: "validation failed",
+                rpcCode: -32603,
+                data: { code: "validation" },
+            },
+            progress: [
+                { sequence: 0, kind: "phase", text: "Review" },
+                { sequence: 1, kind: "phase", text: "Verify" },
+                { sequence: 2, kind: "log", text: "Validation failed" },
+            ],
+        });
+    });
+
     it.each(["nested parallel", "branch progress", "producer progress"] as const)(
         "rejects unsupported %s without letting user catch bypass the profile",
         async (operation) => {

@@ -28,8 +28,8 @@ import {
 import { assertWorkflowResult, assertWorkflowStepResult } from "./workflow-json.js";
 import {
     canonicalWorkflowJson,
-    isWorkflowFailureFatal,
     recordWorkflowFailure,
+    restoreWorkflowFailure,
     replayWorkflow,
     workflowHash,
     WorkflowReplayError,
@@ -49,11 +49,11 @@ export type {
     WorkflowProgressEvent,
 } from "./workflow-executor.js";
 
-const ORCHESTRATOR = "copilot.workflow.async.v2";
-const ADVANCE = "copilot.workflow.advance.v2";
-const EXECUTE_AGENT = "copilot.workflow.agent.v2";
-const EXECUTE_STEP = "copilot.workflow.step.v2";
-const PROGRESS = "copilot.workflow.progress.v2";
+const ORCHESTRATOR = "copilot.workflow.async.v3";
+const ADVANCE = "copilot.workflow.advance.v3";
+const EXECUTE_AGENT = "copilot.workflow.agent.v3";
+const EXECUTE_STEP = "copilot.workflow.step.v3";
+const PROGRESS = "copilot.workflow.progress.v3";
 
 interface PinnedInvocation extends WorkflowInvocation {
     name: string;
@@ -208,7 +208,6 @@ async function* executeParallel(
                 targets: [{ branch, command: state.command }],
             });
         }
-        let failure: WorkflowOutcome | undefined;
         let taskFailure: Error | undefined;
         // All distinct effects are scheduled before the first wait. Drain admitted
         // tasks on failure instead of silently orphaning another parallel branch.
@@ -230,12 +229,12 @@ async function* executeParallel(
                 outcome = winner.getResult();
             }
             if (outcome.status === "fulfilled") memo.set(key, outcome);
-            else if (isWorkflowFailureFatal(outcome.error)) failure ??= outcome;
             for (const target of item.targets) record(target.branch, target.command, outcome);
         }
         // Provider/profile failures must not become catchable branch outcomes.
         if (taskFailure) throw taskFailure;
-        if (failure) return { command: initial.command, outcome: failure, parallel };
+        // Replay every recorded rejection into its own branch first. Only an
+        // unhandled branch failure returned by Advance rejects the aggregate.
         const reply = replayTurn(
             yield context.callActivity<ReplayRequest, WorkflowReplayTurn>(ADVANCE, {
                 input,
@@ -284,6 +283,7 @@ async function* orchestrate(
             yield context.callActivity<ProgressRequest, void>(PROGRESS, { input, event: line });
             progress.push(line);
         }
+        if (turn.status === "failed") throw restoreWorkflowFailure(turn.error);
         if (turn.status === "completed") {
             return turn.result === undefined ? {} : { result: turn.result };
         }

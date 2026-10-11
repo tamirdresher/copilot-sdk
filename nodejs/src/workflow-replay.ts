@@ -79,6 +79,7 @@ export type WorkflowBranchTurn =
 export type WorkflowReplayTurn = (
     | { status: "command"; command: WorkflowCommand }
     | { status: "completed"; result?: JsonValue }
+    | { status: "failed"; error: WorkflowFailure }
     | { status: "parallel"; command: WorkflowParallelCommand; branches: WorkflowBranchTurn[] }
 ) & { progress?: Array<Omit<WorkflowProgressEvent, "eventId">> };
 
@@ -155,6 +156,7 @@ const replayScope = new AsyncLocalStorage<ReplayScope>();
 
 interface ReplayFrame {
     branch?: number;
+    group?: ReplayGroup;
     history: WorkflowHistoryEntry[];
     cursor: number;
     inFlight: boolean;
@@ -166,6 +168,20 @@ interface ReplayFrame {
     rejected: boolean;
     result?: unknown;
     rejection?: unknown;
+}
+
+interface ReplayGroup {
+    frames: ReplayFrame[];
+    history: WorkflowParallelHistory;
+    deliveries: Map<string, () => void>;
+    delivered: number;
+}
+
+interface RecordedParallelReplay {
+    group: ReplayGroup;
+    entry: WorkflowHistoryEntry;
+    resolve: (value: JsonValue) => void;
+    reject: (reason: unknown) => void;
 }
 
 /** @internal */
@@ -205,9 +221,14 @@ export async function replayWorkflow(
     if (parallel) canonicalWorkflowJson(parallel);
     const scope: ReplayScope = {};
     const frames = new AsyncLocalStorage<ReplayFrame>();
-    const makeFrame = (entries: WorkflowHistoryEntry[], branch?: number): ReplayFrame => ({
+    const makeFrame = (
+        entries: WorkflowHistoryEntry[],
+        branch?: number,
+        group?: ReplayGroup
+    ): ReplayFrame => ({
         history: entries,
         branch,
+        group,
         cursor: 0,
         inFlight: false,
         open: true,
@@ -217,9 +238,9 @@ export async function replayWorkflow(
     });
     const root = makeFrame(history);
     const branchFrames: ReplayFrame[] = [];
+    let frontierGroup: ReplayGroup | undefined;
+    let recordedParallel: RecordedParallelReplay | undefined;
     const progress: Array<Omit<WorkflowProgressEvent, "eventId">> = [];
-    const deliveries = new Map<string, () => void>();
-    let delivered = 0;
 
     const fail = (message: string, diverged = false): WorkflowReplayError => {
         const error = new WorkflowReplayError(
@@ -229,41 +250,45 @@ export async function replayWorkflow(
         scope.violation ??= error;
         return error;
     };
-    if (parallel) {
-        const next = parallel.branches.map(() => 0);
-        for (const entry of parallel.completionOrder) {
-            const entries = parallel.branches[entry.branch];
+    const validateParallel = (entries: WorkflowParallelHistory): void => {
+        const next = entries.branches.map(() => 0);
+        for (const entry of entries.completionOrder) {
+            const branch = entries.branches[entry.branch];
             if (
-                !entries ||
+                !branch ||
                 entry.index !== next[entry.branch] ||
-                entries[entry.index]?.command.index !== entry.index ||
-                entries[entry.index]?.command.kind === "parallel"
+                branch[entry.index]?.command.index !== entry.index ||
+                branch[entry.index]?.command.kind === "parallel"
             ) {
                 throw fail("Invalid ordered parallel completion history", true);
             }
             next[entry.branch]++;
         }
-        if (next.some((count, branch) => count !== parallel.branches[branch].length)) {
+        if (next.some((count, branch) => count !== entries.branches[branch].length)) {
             throw fail("Missing parallel completion history", true);
         }
-    }
+    };
+    if (parallel) validateParallel(parallel);
     const parked = (): Promise<never> => new Promise(() => {});
     const unsupported = (operation: string): never => {
         throw fail(`${operation} is unsupported by the durable workflow profile`);
     };
     const current = () => frames.getStore() ?? root;
-    const pump = (): void => {
-        const entry = parallel?.completionOrder[delivered];
+    const pump = (group: ReplayGroup): void => {
+        const entry = group.history.completionOrder[group.delivered];
         if (!entry) return;
         const key = `${entry.branch}:${entry.index}`;
-        const deliver = deliveries.get(key);
+        const deliver = group.deliveries.get(key);
         if (!deliver) return;
-        deliveries.delete(key);
-        delivered++;
+        group.deliveries.delete(key);
+        group.delivered++;
         deliver();
-        void Promise.resolve().then(pump);
+        void Promise.resolve().then(() => pump(group));
     };
-    const issue = (command: WorkflowCommand): Promise<JsonValue> => {
+    const issue = (
+        command: WorkflowCommand,
+        replayParallel?: (entry: WorkflowHistoryEntry) => Promise<JsonValue>
+    ): Promise<JsonValue> => {
         const frame = current();
         if (!frame.open || frame.producing) {
             throw fail(
@@ -283,6 +308,10 @@ export async function replayWorkflow(
                 fail(`Workflow operation ${command.index} changed during replay`, true);
                 return parked();
             }
+            if (command.kind === "parallel") {
+                if (!replayParallel) throw fail("Missing parallel replay continuation", true);
+                return replayParallel(recorded);
+            }
             const outcome = () => {
                 frame.inFlight = false;
                 if (recorded.outcome.status === "rejected") {
@@ -291,15 +320,17 @@ export async function replayWorkflow(
                 return structuredClone(recorded.outcome.value);
             };
             if (frame.branch === undefined) return Promise.resolve().then(outcome);
+            const group = frame.group;
+            if (!group) throw fail("Missing parallel replay group", true);
             return new Promise((resolve, reject) => {
-                deliveries.set(`${frame.branch}:${command.index}`, () => {
+                group.deliveries.set(`${frame.branch}:${command.index}`, () => {
                     try {
                         resolve(outcome());
                     } catch (error) {
                         reject(error);
                     }
                 });
-                pump();
+                pump(group);
             });
         }
         frame.frontier = structuredClone(command);
@@ -321,6 +352,88 @@ export async function replayWorkflow(
                     }
                 );
         });
+    };
+    const startParallel = (
+        thunks: Array<() => unknown>,
+        entries: WorkflowParallelHistory
+    ): ReplayGroup => {
+        validateParallel(entries);
+        if (entries.branches.length !== thunks.length) {
+            throw fail("Parallel branch count changed during replay", true);
+        }
+        const group: ReplayGroup = {
+            frames: [],
+            history: entries,
+            deliveries: new Map(),
+            delivered: 0,
+        };
+        for (const [branch, thunk] of thunks.entries()) {
+            const frame = makeFrame(entries.branches[branch], branch, group);
+            group.frames.push(frame);
+            branchFrames.push(frame);
+            start(frame, thunk);
+        }
+        return group;
+    };
+    const inspectBranch = (frame: ReplayFrame): WorkflowBranchTurn => {
+        if (frame.frontier) {
+            if (frame.settled) throw fail("Parallel branch did not await its pending operation");
+            if (frame.frontier.kind === "parallel") return unsupported("Nested parallel()");
+            return { status: "command", command: frame.frontier };
+        }
+        if (!frame.settled) throw fail("Uncontrolled promise in parallel branch");
+        if (frame.cursor !== frame.history.length) {
+            throw fail("Parallel branch omitted recorded operations", true);
+        }
+        if (frame.rejected) {
+            const failure = recordWorkflowFailure(frame.rejection);
+            return isWorkflowFailureFatal(failure)
+                ? { status: "failed", error: failure }
+                : { status: "completed", result: null };
+        }
+        try {
+            assertStrictJson(frame.result, {
+                code: "workflow_result_not_json",
+                label: "Parallel result",
+                allowTopLevelUndefined: false,
+            });
+        } catch {
+            throw fail("Parallel branch result must be lossless JSON");
+        }
+        if (frame.result === undefined) throw fail("Parallel branch returned undefined");
+        return { status: "completed", result: frame.result };
+    };
+    const settleRecordedParallel = (recorded: RecordedParallelReplay): void => {
+        const { group, entry } = recorded;
+        if (group.delivered !== group.history.completionOrder.length) {
+            throw fail("Parallel completion history could not be replayed", true);
+        }
+        const branches = group.frames.map(inspectBranch);
+        const fatal = branches.find((branch) => branch.status === "failed");
+        let outcome: WorkflowOutcome;
+        if (fatal?.status === "failed") {
+            outcome = { status: "rejected", error: fatal.error };
+        } else {
+            outcome = {
+                status: "fulfilled",
+                value: branches.map((branch) => {
+                    if (branch.status !== "completed") {
+                        throw fail("Completed parallel replay issued an unrecorded effect", true);
+                    }
+                    return branch.result;
+                }),
+            };
+        }
+        if (canonicalWorkflowJson(outcome) !== canonicalWorkflowJson(entry.outcome)) {
+            throw fail("Parallel outcome changed during replay", true);
+        }
+        recordedParallel = undefined;
+        root.inFlight = false;
+        if (entry.outcome.status === "rejected") {
+            recorded.reject(restoreWorkflowFailure(entry.outcome.error));
+        } else {
+            recorded.resolve(structuredClone(entry.outcome.value));
+        }
     };
     const emit = (kind: "phase" | "log", text: string): void => {
         const frame = current();
@@ -379,16 +492,21 @@ export async function replayWorkflow(
                     workflowHash(Function.prototype.toString.call(thunk))
                 ),
             };
-            const pending = issue(command);
+            const pending = issue(command, (entry) => {
+                if (!entry.parallel) throw fail("Missing completed parallel history", true);
+                const group = startParallel(thunks, entry.parallel);
+                return new Promise((resolve, reject) => {
+                    recordedParallel = { group, entry, resolve, reject };
+                });
+            });
             if (root.frontier?.index === command.index && root.frontier.kind === "parallel") {
-                if (parallel && parallel.branches.length !== thunks.length) {
-                    throw fail("Parallel branch count changed during replay", true);
-                }
-                for (const [branch, thunk] of thunks.entries()) {
-                    const frame = makeFrame(parallel?.branches[branch] ?? [], branch);
-                    branchFrames.push(frame);
-                    start(frame, thunk);
-                }
+                frontierGroup = startParallel(
+                    thunks,
+                    parallel ?? {
+                        branches: thunks.map(() => []),
+                        completionOrder: [],
+                    }
+                );
             }
             return pending as Promise<Array<TResult | null>>;
         },
@@ -416,6 +534,15 @@ export async function replayWorkflow(
         });
         // Drain the pure promise continuations, not arbitrary host I/O or timers.
         await setImmediate();
+        while (recordedParallel) {
+            if (scope.violation) throw scope.violation;
+            if (root.settled)
+                throw fail("Workflow settled without awaiting its pending SDK operation");
+            // Rebuild lexical captures by running the recorded branch continuations
+            // before returning the aggregate to the root's async flow.
+            settleRecordedParallel(recordedParallel);
+            await setImmediate();
+        }
         if (scope.violation) throw scope.violation;
         const withProgress = progress.length ? { progress } : {};
         const captureProducer = (frame: ReplayFrame) => {
@@ -439,41 +566,19 @@ export async function replayWorkflow(
             if (root.settled)
                 throw fail("Workflow settled without awaiting its pending SDK operation");
             if (root.frontier.kind === "parallel") {
-                if (parallel && delivered !== parallel.completionOrder.length) {
+                const group = frontierGroup;
+                if (!group) throw fail("Missing parallel frontier", true);
+                if (group.delivered !== group.history.completionOrder.length) {
                     throw fail("Parallel completion history could not be replayed", true);
                 }
                 const producers = new Map<number, () => Promise<JsonValue>>();
-                const branches: WorkflowBranchTurn[] = branchFrames.map((frame, branch) => {
-                    if (frame.frontier) {
-                        if (frame.settled)
-                            throw fail("Parallel branch did not await its pending operation");
-                        if (frame.frontier.kind === "parallel")
-                            return unsupported("Nested parallel()");
+                const branches = group.frames.map((frame, branch) => {
+                    const turn = inspectBranch(frame);
+                    if (turn.status === "command") {
                         const producer = captureProducer(frame);
                         if (producer) producers.set(branch, producer);
-                        return { status: "command", command: frame.frontier };
                     }
-                    if (!frame.settled) throw fail("Uncontrolled promise in parallel branch");
-                    if (frame.cursor !== frame.history.length)
-                        throw fail("Parallel branch omitted recorded operations", true);
-                    if (frame.rejected) {
-                        const failure = recordWorkflowFailure(frame.rejection);
-                        return isWorkflowFailureFatal(failure)
-                            ? { status: "failed", error: failure }
-                            : { status: "completed", result: null };
-                    }
-                    try {
-                        assertStrictJson(frame.result, {
-                            code: "workflow_result_not_json",
-                            label: "Parallel result",
-                            allowTopLevelUndefined: false,
-                        });
-                    } catch {
-                        throw fail("Parallel branch result must be lossless JSON");
-                    }
-                    if (frame.result === undefined)
-                        throw fail("Parallel branch returned undefined");
-                    return { status: "completed", result: frame.result };
+                    return turn;
                 });
                 return {
                     turn: { status: "parallel", command: root.frontier, branches, ...withProgress },
@@ -491,7 +596,15 @@ export async function replayWorkflow(
         if (!root.settled) throw fail("Uncontrolled promise: workflow must await an SDK operation");
         if (root.cursor !== history.length)
             throw fail("Workflow omitted recorded operations", true);
-        if (root.rejected) throw root.rejection;
+        if (root.rejected) {
+            return {
+                turn: {
+                    status: "failed",
+                    error: recordWorkflowFailure(root.rejection),
+                    ...withProgress,
+                },
+            };
+        }
         assertWorkflowResult(root.result);
         return {
             turn:

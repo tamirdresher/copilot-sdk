@@ -4,12 +4,46 @@ import { setTimeout } from "node:timers/promises";
 import { Metadata } from "@grpc/grpc-js";
 import { NoOpLogger, TaskHubGrpcClient, TaskHubGrpcWorker } from "@microsoft/durabletask-js";
 import { reviewChanged } from "../../../samples/review-changed.mjs";
+import { defineWorkflow } from "../../../dist/extension.js";
 import { DtsWorkflowExecutor } from "../../../dist/workflow-dts.js";
 
-const [hostAddress, directory, runId, mode] = process.argv.slice(2);
-if (!hostAddress || !directory || !runId || !["park", "complete"].includes(mode)) {
+const [hostAddress, directory, runId, mode, scenario = "published-parallel"] =
+    process.argv.slice(2);
+if (
+    !hostAddress ||
+    !directory ||
+    !runId ||
+    !["park", "complete"].includes(mode) ||
+    !["published-parallel", "parallel-captures"].includes(scenario)
+) {
     throw new Error("Expected endpoint, observation directory, run ID, and worker mode");
 }
+const workflow =
+    scenario === "parallel-captures"
+        ? defineWorkflow({
+              meta: {
+                  name: "parallel-captures",
+                  description: "Rebuild branch captures after worker loss",
+                  phases: [{ title: "Review" }, { title: "Verify" }],
+              },
+              run: async (ctx) => {
+                  const values = {};
+                  ctx.phase("Review");
+                  await ctx.parallel(
+                      ctx.args.files.map((file) => async () => {
+                          values[file] = await ctx.agent(`Review ${file}`, {
+                              label: `Review ${file}`,
+                          });
+                          return null;
+                      })
+                  );
+                  ctx.phase("Verify");
+                  const report = await ctx.step("report", () => ({ values }));
+                  ctx.log(`Completed workflow run ${ctx.runId}`);
+                  return report;
+              },
+          })
+        : reviewChanged;
 const writeRecord = (name, value) => {
     const target = join(directory, name);
     writeFileSync(`${target}.tmp`, JSON.stringify(value));
@@ -49,8 +83,8 @@ const observedProgress = new Set(
 const executor = new DtsWorkflowExecutor({
     client,
     worker,
-    workflows: [reviewChanged],
-    codeVersion: "published-parallel-fixture-v2",
+    workflows: [workflow],
+    codeVersion: `parallel-fixture-v3-${scenario}`,
     executionHost: {
         agent: async (activity, prompt, options) => {
             const stage =
@@ -88,7 +122,7 @@ try {
         pid: process.pid,
         instanceId: executor.getInstanceId(invocation),
     });
-    const result = await executor.run(reviewChanged, invocation);
+    const result = await executor.run(workflow, invocation);
     writeRecord("completed.json", { instanceId: executor.getInstanceId(invocation), ...result });
 } catch (error) {
     writeRecord("error.json", { message: String(error) });
