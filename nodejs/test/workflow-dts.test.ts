@@ -20,6 +20,8 @@ import {
     DtsWorkflowExecutor,
     DtsWorkflowContinuationExecutor,
     type WorkflowExecutionHost,
+    type WorkflowInvocation,
+    type WorkflowProgressEvent,
 } from "../src/workflow-dts.js";
 import {
     defineWorkflow,
@@ -92,7 +94,7 @@ function deferred<T>() {
 }
 
 describe("DTS new-native-carrier handoff (mock scheduler, no native recovery claim)", () => {
-    it("reuses a completed effect, sends remaining work to the new host, and remaps progress", async () => {
+    async function exerciseProgressHost(mutates: boolean): Promise<void> {
         const flow = workflow(async (ctx) => {
             const first = json(await ctx.agent("first"));
             const second = json(await ctx.agent("second"));
@@ -120,8 +122,32 @@ describe("DTS new-native-carrier handoff (mock scheduler, no native recovery cla
             agent: vi.fn(async () => 7),
             step: async (_input, _key, producer) => producer(),
         };
-        const progress = vi.fn(async (_invocation, _event) => {});
-        const newHost: WorkflowExecutionHost = {
+        type ProgressHost = WorkflowExecutionHost & {
+            receiver: string;
+            receipts: Array<{ runId: string; sequence: number; eventId: string; text: string }>;
+        };
+        const progress = vi.fn(async function (
+            this: ProgressHost,
+            carrier: WorkflowInvocation,
+            event: WorkflowProgressEvent
+        ) {
+            expect(this.receiver).toBe("new-host");
+            this.receipts.push({
+                runId: carrier.runId,
+                sequence: event.sequence,
+                eventId: event.eventId,
+                text: event.text,
+            });
+            if (mutates) {
+                event.sequence = 999;
+                event.eventId = "sink-mutated";
+                event.text = "sink-mutated";
+                carrier.runId = "sink-mutated";
+            }
+        });
+        const newHost: ProgressHost = {
+            receiver: "new-host",
+            receipts: [],
             agent: vi.fn(async (logical, prompt) => {
                 expect(logical.runId).toBe("old-native");
                 expect(prompt).toBe("second");
@@ -201,13 +227,18 @@ describe("DTS new-native-carrier handoff (mock scheduler, no native recovery cla
         expect(newHost.agent).toHaveBeenCalledOnce();
         expect(scheduleNewOrchestration).toHaveBeenCalledOnce();
         expect(
-            progress.mock.calls.map(([scope, line]) => [scope.runId, line.sequence, line.eventId])
+            newHost.receipts.map((line) => [line.runId, line.sequence, line.eventId, line.text])
         ).toEqual([
-            ["new-native", 0, "scope:new-native:progress:0"],
-            ["new-native", 0, "scope:new-native:progress:0"],
-            ["new-native", 1, "scope:new-native:progress:1"],
+            ["new-native", 0, "scope:new-native:progress:0", "line-7"],
+            ["new-native", 0, "scope:new-native:progress:0", "line-7"],
+            ["new-native", 1, "scope:new-native:progress:1", "line-8"],
         ]);
-    });
+    }
+
+    it.each([false, true])(
+        "reuses completed work and preserves a method-dependent progress sink (mutates=%s)",
+        exerciseProgressHost
+    );
 
     it("rejects absent instances and changed carrier identity without scheduling", async () => {
         const flow = workflow(async () => null);

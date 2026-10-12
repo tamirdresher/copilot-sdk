@@ -678,7 +678,7 @@ export class DtsWorkflowContinuationExecutor implements WorkflowExecutor {
             this.progress.set(carrier.runId, lines);
         }
         const progressLines = lines;
-        const progressSink = host.progress;
+        const progressSink = host.progress?.bind(host);
         return this.executor.attach(
             definition,
             structuredClone(this.original),
@@ -709,7 +709,10 @@ export class DtsWorkflowContinuationExecutor implements WorkflowExecutor {
                                   };
                                   progressLines.set(event.eventId, remapped);
                               }
-                              await progressSink(carrier, remapped);
+                              await progressSink(
+                                  structuredClone(carrier),
+                                  structuredClone(remapped)
+                              );
                           },
                       }
                     : {}),
