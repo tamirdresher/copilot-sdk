@@ -487,6 +487,34 @@ native session-token rebinding need a runtime/service owner before this binding
 can be shipped through native authoring tools. Unsupported operations do not
 fall back to the local journal.
 
+### Explicit new-native-carrier handoff (prototype)
+
+`DtsWorkflowContinuationExecutor` accepts a trusted saved `WorkflowInvocation`
+(plain JSON: `scopeId`, logical `runId`, `args`) and the original workflow handle.
+Register it as `workflowExecutor` for a **new, separately authorized native run**:
+
+```js
+import { readFile } from "node:fs/promises";
+import { DtsWorkflowContinuationExecutor } from "@github/copilot-sdk/workflow-dts";
+const saved = JSON.parse(await readFile("trusted-invocation.json", "utf8"));
+const continuation = new DtsWorkflowContinuationExecutor(executor, reviewChanged, saved);
+await joinSession({ workflows: [reviewChanged], workflowExecutor: continuation });
+```
+
+The new run must have the same scope, arguments and pinned workflow but a
+different native run ID. Its current host/signal serves the old DTS identity.
+Attachment fails if that instance is missing or suspended; it never silently
+schedules a replacement. Existing code/runtime pins are checked against its
+stored input. Tokens and credentials are not saved in the mapping.
+
+Only newly emitted logical progress is forwarded, remapped to sequence zero
+on the new native carrier with stable per-carrier IDs; old native progress is
+not impersonated or reconstructed. This is not automatic session recovery,
+reopening an interrupted native run, or a cumulative budget/lease/cancel manager.
+The caller must authorize the new run and retain old accounting, pause/cancel
+and limit decisions. Native closures use the current callback's authority.
+Deterministic handoff tests are not real model or native process recovery proof.
+
 ### Developer restart proof
 
 The provider requires Node.js 22 or later and the optional peer

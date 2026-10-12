@@ -4,19 +4,26 @@
 
 import {
     InMemoryOrchestrationBackend,
+    ActivityContext,
     OrchestrationState,
     OrchestrationStatus,
     TestOrchestrationClient,
     TestOrchestrationWorker,
     type StartOrchestrationOptions,
     type TaskHubGrpcClient,
+    type TaskHubGrpcWorker,
 } from "@microsoft/durabletask-js";
 import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { ResponseError } from "vscode-jsonrpc/node.js";
-import { DtsWorkflowExecutor, type WorkflowExecutionHost } from "../src/workflow-dts.js";
+import {
+    DtsWorkflowExecutor,
+    DtsWorkflowContinuationExecutor,
+    type WorkflowExecutionHost,
+} from "../src/workflow-dts.js";
 import {
     defineWorkflow,
+    getWorkflowDefinition,
     type JsonValue,
     type WorkflowDefinition,
     type WorkflowHandle,
@@ -83,6 +90,163 @@ function deferred<T>() {
     });
     return { promise, resolve, reject };
 }
+
+describe("DTS new-native-carrier handoff (mock scheduler, no native recovery claim)", () => {
+    it("reuses a completed effect, sends remaining work to the new host, and remaps progress", async () => {
+        const flow = workflow(async (ctx) => {
+            const first = json(await ctx.agent("first"));
+            const second = json(await ctx.agent("second"));
+            return { first, second };
+        });
+        const definition = getWorkflowDefinition(flow);
+        const original = { scopeId: "scope", runId: "old-native", args: { input: 1 } };
+        const current = { ...original, runId: "new-native", args: { ...original.args } };
+        const activities = new Map<string, Parameters<TaskHubGrpcWorker["addNamedActivity"]>[1]>();
+        const worker = new TestOrchestrationWorker(new InMemoryOrchestrationBackend());
+        vi.spyOn(worker, "addNamedActivity").mockImplementation((name, body) => {
+            activities.set(name, body);
+            return name;
+        });
+        const invoke = async (name: string, input: unknown) => {
+            const activity = activities.get(name);
+            if (!activity) throw new Error(`Missing activity ${name}`);
+            return await activity(new ActivityContext("instance", 1), input);
+        };
+        let saved: unknown;
+        let firstOutcome: unknown;
+        let calls = 0;
+        const controller = new AbortController();
+        const oldHost: WorkflowExecutionHost = {
+            agent: vi.fn(async () => 7),
+            step: async (_input, _key, producer) => producer(),
+        };
+        const progress = vi.fn(async (_invocation, _event) => {});
+        const newHost: WorkflowExecutionHost = {
+            agent: vi.fn(async (logical, prompt) => {
+                expect(logical.runId).toBe("old-native");
+                expect(prompt).toBe("second");
+                return 9;
+            }),
+            step: async (_input, _key, producer) => producer(),
+            progress,
+        };
+        const state = (status: OrchestrationStatus, result?: unknown) =>
+            new OrchestrationState(
+                "instance",
+                "copilot.workflow.async.v3",
+                status,
+                new Date(0),
+                new Date(0),
+                JSON.stringify(saved),
+                result === undefined ? undefined : JSON.stringify(result)
+            );
+        const scheduleNewOrchestration = vi.fn(async (_name: unknown, input?: unknown) => {
+            saved = structuredClone(input);
+            return "instance";
+        });
+        const getOrchestrationState = vi.fn(async () => {
+            calls++;
+            if (calls === 1) return undefined;
+            if (calls === 2) {
+                firstOutcome = await invoke("copilot.workflow.agent.v3", {
+                    input: saved,
+                    history: [],
+                    command: { index: 0, kind: "agent", prompt: "first", options: {} },
+                });
+                controller.abort();
+                return state(OrchestrationStatus.RUNNING);
+            }
+            if (calls === 3) return state(OrchestrationStatus.RUNNING);
+            const history = [
+                {
+                    command: { index: 0, kind: "agent", prompt: "first", options: {} },
+                    outcome: firstOutcome,
+                },
+            ];
+            const turn = await invoke("copilot.workflow.advance.v3", { input: saved, history });
+            expect(turn).toMatchObject({
+                status: "command",
+                command: { index: 1, prompt: "second" },
+            });
+            const second = await invoke("copilot.workflow.agent.v3", {
+                input: saved,
+                history,
+                command: turn.command,
+            });
+            for (const sequence of [7, 7, 8]) {
+                await invoke("copilot.workflow.progress.v3", {
+                    input: saved,
+                    event: { sequence, kind: "log", text: `line-${sequence}` },
+                });
+            }
+            return state(OrchestrationStatus.COMPLETED, {
+                result: { first: 7, second: second.value },
+            });
+        });
+        const executor = new DtsWorkflowExecutor({
+            client: { getOrchestrationState, scheduleNewOrchestration },
+            worker,
+            workflows: [flow],
+            codeVersion: "handoff-test",
+        });
+        await expect(
+            executor.execute(definition, original, oldHost, controller.signal)
+        ).rejects.toMatchObject({ name: "AbortError" });
+        const continuation = new DtsWorkflowContinuationExecutor(executor, flow, original);
+        original.args.input = 99; // Caller mutation must not change the saved trusted mapping.
+        await expect(
+            continuation.execute(definition, current, newHost, new AbortController().signal)
+        ).resolves.toEqual({ result: { first: 7, second: 9 } });
+        expect(oldHost.agent).toHaveBeenCalledOnce();
+        expect(newHost.agent).toHaveBeenCalledOnce();
+        expect(scheduleNewOrchestration).toHaveBeenCalledOnce();
+        expect(
+            progress.mock.calls.map(([scope, line]) => [scope.runId, line.sequence, line.eventId])
+        ).toEqual([
+            ["new-native", 0, "scope:new-native:progress:0"],
+            ["new-native", 0, "scope:new-native:progress:0"],
+            ["new-native", 1, "scope:new-native:progress:1"],
+        ]);
+    });
+
+    it("rejects absent instances and changed carrier identity without scheduling", async () => {
+        const flow = workflow(async () => null);
+        const context = setup(flow, {
+            agent: async () => null,
+            step: async (_input, _key, producer) => producer(),
+        });
+        const schedule = vi.spyOn(context.binding, "scheduleNewOrchestration");
+        const saved = { scopeId: "scope", runId: "old", args: { input: 1 } };
+        const continuation = new DtsWorkflowContinuationExecutor(context.executor, flow, saved);
+        const definition = getWorkflowDefinition(flow);
+        const signal = new AbortController().signal;
+        const host: WorkflowExecutionHost = {
+            agent: async () => null,
+            step: async (_input, _key, producer) => producer(),
+        };
+        await expect(
+            continuation.execute(definition, { ...saved, runId: "new" }, host, signal)
+        ).rejects.toThrow("instance is missing");
+        for (const current of [
+            saved,
+            { ...saved, runId: "new", scopeId: "different" },
+            { ...saved, runId: "new", args: { input: 2 } },
+        ]) {
+            await expect(
+                continuation.execute(definition, current, host, signal)
+            ).rejects.toMatchObject({ code: "workflow_replay_diverged" });
+        }
+        await expect(
+            continuation.execute(
+                getWorkflowDefinition(workflow(async () => "changed")),
+                { ...saved, runId: "new" },
+                host,
+                signal
+            )
+        ).rejects.toMatchObject({ code: "workflow_replay_diverged" });
+        expect(schedule).not.toHaveBeenCalled();
+    });
+});
 
 describe("DTS scheduler RPC cancellation (mocked transport)", () => {
     it.each(

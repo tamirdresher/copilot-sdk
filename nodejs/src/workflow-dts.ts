@@ -471,6 +471,26 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
         host: WorkflowExecutionHost,
         signal: AbortSignal
     ): Promise<{ result?: JsonValue }> {
+        return this.executeInvocation(definition, invocation, host, signal, false);
+    }
+
+    /** Attach to an existing logical run; never admit a replacement instance. */
+    async attach(
+        definition: WorkflowDefinition,
+        invocation: WorkflowInvocation,
+        host: WorkflowExecutionHost,
+        signal: AbortSignal
+    ): Promise<{ result?: JsonValue }> {
+        return this.executeInvocation(definition, invocation, host, signal, true);
+    }
+
+    private async executeInvocation(
+        definition: WorkflowDefinition,
+        invocation: WorkflowInvocation,
+        host: WorkflowExecutionHost,
+        signal: AbortSignal,
+        attachOnly: boolean
+    ): Promise<{ result?: JsonValue }> {
         signal.throwIfAborted();
         const input: PinnedInvocation = {
             ...structuredClone(invocation),
@@ -503,7 +523,12 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
                         "Workflow definition, runtime version, or input changed for this run"
                     );
                 }
+                if (attachOnly && existing.runtimeStatus === OrchestrationStatus.SUSPENDED) {
+                    throw new Error("Cannot attach: durable workflow is suspended");
+                }
             } else {
+                if (attachOnly)
+                    throw new Error("Cannot attach: durable workflow instance is missing");
                 await awaitWorkflowOperation(
                     () =>
                         this.options.client.scheduleNewOrchestration(ORCHESTRATOR, input, {
@@ -512,6 +537,7 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
                     signal
                 );
             }
+
             while (true) {
                 signal.throwIfAborted();
                 const state = await awaitWorkflowOperation(
@@ -599,5 +625,96 @@ export class DtsWorkflowExecutor implements WorkflowExecutor {
             if (error instanceof WorkflowReplayError) throw error;
             return { status: "rejected", error: recordWorkflowFailure(error) };
         }
+    }
+}
+
+/**
+ * Hand an existing logical DTS invocation to a NEW authorized native carrier.
+ * Does not reopen the old native run or manage cumulative budgets/lifecycle.
+ * @experimental
+ */
+export class DtsWorkflowContinuationExecutor implements WorkflowExecutor {
+    private readonly original: WorkflowInvocation;
+    private readonly definition: WorkflowDefinition;
+    private readonly progress = new Map<string, Map<string, WorkflowProgressEvent>>();
+
+    constructor(
+        private readonly executor: DtsWorkflowExecutor,
+        workflow: WorkflowHandle,
+        original: WorkflowInvocation
+    ) {
+        canonicalWorkflowJson(original);
+        this.original = structuredClone(original);
+        this.executor.getInstanceId(this.original);
+        this.definition = getWorkflowDefinition(workflow);
+    }
+
+    async execute(
+        definition: WorkflowDefinition,
+        current: WorkflowInvocation,
+        host: WorkflowExecutionHost,
+        signal: AbortSignal
+    ): Promise<{ result?: JsonValue }> {
+        signal.throwIfAborted();
+        if (
+            current.scopeId !== this.original.scopeId ||
+            !current.runId ||
+            current.runId === this.original.runId ||
+            canonicalWorkflowJson(current.args) !== canonicalWorkflowJson(this.original.args) ||
+            canonicalWorkflowJson(definition.meta) !==
+                canonicalWorkflowJson(this.definition.meta) ||
+            Function.prototype.toString.call(definition.run) !==
+                Function.prototype.toString.call(this.definition.run)
+        ) {
+            throw new WorkflowReplayError(
+                "workflow_replay_diverged",
+                "Carrier scope, arguments, or workflow identity changed"
+            );
+        }
+        const carrier = structuredClone(current);
+        let lines = this.progress.get(carrier.runId);
+        if (!lines) {
+            lines = new Map();
+            this.progress.set(carrier.runId, lines);
+        }
+        const progressLines = lines;
+        const progressSink = host.progress;
+        return this.executor.attach(
+            definition,
+            structuredClone(this.original),
+            {
+                agent: (invocation, prompt, options) => host.agent(invocation, prompt, options),
+                step: (invocation, key, producer) => host.step(invocation, key, producer),
+                ...(progressSink
+                    ? {
+                          progress: async (
+                              _invocation: WorkflowInvocation,
+                              event: WorkflowProgressEvent
+                          ) => {
+                              let remapped = progressLines.get(event.eventId);
+                              if (
+                                  remapped &&
+                                  (remapped.kind !== event.kind || remapped.text !== event.text)
+                              ) {
+                                  throw new WorkflowReplayError(
+                                      "workflow_replay_diverged",
+                                      "Carrier progress identity changed"
+                                  );
+                              }
+                              if (!remapped) {
+                                  remapped = {
+                                      ...event,
+                                      sequence: progressLines.size,
+                                      eventId: `${carrier.scopeId}:${carrier.runId}:progress:${progressLines.size}`,
+                                  };
+                                  progressLines.set(event.eventId, remapped);
+                              }
+                              await progressSink(carrier, remapped);
+                          },
+                      }
+                    : {}),
+            },
+            signal
+        );
     }
 }
